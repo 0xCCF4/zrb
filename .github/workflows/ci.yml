@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets -- -W clippy::pedantic -D warnings
+      - name: Unit tests
+        run: cargo test
+
+  integration:
+    name: Integration (ZFS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ZFS userland tools
+        run: sudo apt-get update -y && sudo apt-get install -y zfsutils-linux
+      - name: All tests (including ZFS integration)
+        run: sudo env "PATH=$PATH" cargo test -- --include-ignored
+
+  nix-eval:
+    name: Nix module eval tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Ensure git HEAD exists
+        run: |
+          git config --global --add safe.directory '*'
+          if ! git rev-parse HEAD > /dev/null 2>&1; then
+            rm -rf .git
+            git init
+            git config user.email ci@localhost
+            git config user.name CI
+            git add -A
+            git commit -m init
+          fi
+      - name: Eval tests
+        run: nix build .#checks.x86_64-linux.module-eval-tests
