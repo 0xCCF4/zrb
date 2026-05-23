@@ -1,0 +1,52 @@
+name: Install crates
+
+on:
+  schedule:
+    - cron: "* 13 * * 1"
+
+env:
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  crates_build:
+    strategy:
+      matrix:
+        os: [ ubuntu-latest ]
+        rustalias: [ stable, nightly ]
+        feature_flag: [ "" ]
+        include:
+          - rustalias: stable
+            rust: stable
+          - rustalias: nightly
+            rust: nightly
+
+    name: 'Build and test ${{ matrix.feature_flag }}: ${{ matrix.os }}, ${{ matrix.rustalias }}'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+          override: true
+
+      - name: Install
+        uses: actions-rs/cargo@v1
+        with:
+          command: install
+          args: zrb --bin zrb ${{ matrix.feature_flag }}
+
+  nix_build:
+    name: 'Build nix version for <nixpkgs/${{ matrix.nixpkgs }}>'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        nixpkgs:
+          - release-25.05
+          - release-25.11
+          - nixos-unstable
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+      - run: timeout 5m nix build github:0xCCF4/zrb -L --no-update-lock-file --no-write-lock-file --override-input nixpkgs github:nixos/nixpkgs/${{ matrix.nixpkgs }}
