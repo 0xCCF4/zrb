@@ -2,6 +2,23 @@
 name = "zrb"
 version = "0.1.0"
 edition = "2024"
+description = "Incremental ZFS snapshot replication over SSH with resumable transfers and retention-based pruning"
+license = "GPL-3.0-only"
+license-file = "LICENSE.md"
+authors = ["0xCCF4"]
+repository = "https://github.com/0xCCF4/zrb"
+homepage = "https://github.com/0xCCF4/zrb"
+readme = "README.md"
+keywords = ["zfs", "backup", "snapshot", "ssh", "zfs-send"]
+categories = ["command-line-utilities", "filesystem"]
+exclude = [
+    "nix/**",
+    "flake.nix",
+    "flake.lock",
+    ".github/**",
+    ".scratch/**",
+    "result",
+]
 
 [[bin]]
 name = "zrb"
