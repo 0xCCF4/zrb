@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,7 @@ pub fn encode_server_hello<W: Write>(msg: &ServerHello, dest: &mut W) -> Result<
 
 /// # Errors
 /// Returns `CodecError` on I/O or JSON deserialization failure.
-pub fn decode_server_hello<R: Read>(src: &mut R) -> Result<ServerHello, CodecError> {
+pub fn decode_server_hello<R: BufRead>(src: &mut R) -> Result<ServerHello, CodecError> {
     decode_json(src)
 }
 
@@ -60,7 +60,7 @@ pub fn encode_client_hello<W: Write>(msg: &ClientHello, dest: &mut W) -> Result<
 
 /// # Errors
 /// Returns `CodecError` on I/O or JSON deserialization failure.
-pub fn decode_client_hello<R: Read>(src: &mut R) -> Result<ClientHello, CodecError> {
+pub fn decode_client_hello<R: BufRead>(src: &mut R) -> Result<ClientHello, CodecError> {
     decode_json(src)
 }
 
@@ -75,21 +75,20 @@ pub fn encode_server_status<W: Write>(msg: &ServerStatus, dest: &mut W) -> Resul
 
 /// # Errors
 /// Returns `CodecError` on I/O or JSON deserialization failure.
-pub fn decode_server_status<R: Read>(src: &mut R) -> Result<ServerStatus, CodecError> {
+pub fn decode_server_status<R: BufRead>(src: &mut R) -> Result<ServerStatus, CodecError> {
     decode_json(src)
 }
 
-fn decode_json<T: for<'de> Deserialize<'de>, R: Read>(src: &mut R) -> Result<T, CodecError> {
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        let n = src.read(&mut byte)?;
-        if n == 0 || byte[0] == b'\n' {
-            break;
-        }
-        buf.push(byte[0]);
+fn decode_json<T: for<'de> Deserialize<'de>, R: BufRead>(src: &mut R) -> Result<T, CodecError> {
+    let mut line = String::new();
+    let n = src.read_line(&mut line)?;
+    if n == 0 {
+        return Err(CodecError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "connection closed mid-message",
+        )));
     }
-    Ok(serde_json::from_slice(&buf)?)
+    Ok(serde_json::from_str(line.trim_end_matches('\n'))?)
 }
 
 /// Write `source` as 4 MiB chunks with 5-byte Control Frames to `dest`.

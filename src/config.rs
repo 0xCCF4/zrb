@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -35,11 +36,14 @@ struct SourceSection {
     pub name: String,
 }
 
+/// Maps a remote name to the target dataset path on that remote.
+pub type RemoteTargets = HashMap<String, String>;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SourceConfig {
     source: SourceSection,
-    pub remotes: std::collections::HashMap<String, RemoteConfig>,
-    pub datasets: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    pub remotes: HashMap<String, RemoteConfig>,
+    pub datasets: HashMap<String, RemoteTargets>,
     pub retention: RetentionConfig,
 }
 
@@ -65,7 +69,7 @@ pub struct ClientConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     server: ServerSection,
-    pub clients: std::collections::HashMap<String, ClientConfig>,
+    pub clients: HashMap<String, ClientConfig>,
     pub retention: RetentionConfig,
 }
 

@@ -67,10 +67,13 @@ fn parse_list_output(output: &str) -> Vec<String> {
 /// Returns [`ClientError`] if the `zfs` process cannot be spawned or exits non-zero.
 ///
 /// # Panics
-/// Panics if `snapshot` does not contain `@` — this is a guardrail against accidentally
-/// destroying a dataset instead of a snapshot.
+/// Panics if `snapshot` is not of the form `<dataset>@zrb-<suffix>` — guardrail against
+/// accidentally destroying a dataset instead of a zrb-managed snapshot.
 pub fn destroy_snapshot(snapshot: &str) -> Result<(), ClientError> {
-    assert!(snapshot.contains("zrb-"), "Guardrail tripped, tried to destroy non-zrb-snapshot {snapshot}, huh!");
+    assert!(
+        snapshot.split_once('@').is_some_and(|(_, name)| name.starts_with("zrb-")),
+        "Guardrail tripped: not a zrb snapshot: {snapshot}"
+    );
     let mut cmd = Command::new("zfs");
     cmd.arg("destroy").arg(snapshot);
     run(cmd).map(|_| ())
@@ -275,6 +278,20 @@ fn parse_discovered_datasets(output: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "Guardrail tripped")]
+    fn destroy_snapshot_panics_on_bare_dataset_with_zrb_prefix() {
+        // A dataset named "zrb-tank/data" would pass the old contains("zrb-") check
+        // but must be rejected because it has no '@'.
+        let _ = super::destroy_snapshot("zrb-tank/data");
+    }
+
+    #[test]
+    #[should_panic(expected = "Guardrail tripped")]
+    fn destroy_snapshot_panics_on_non_zrb_snapshot() {
+        let _ = super::destroy_snapshot("tank/data@manual-backup");
+    }
 
     #[test]
     fn discover_empty_output_gives_empty_vec() {

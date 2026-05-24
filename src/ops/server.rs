@@ -1,4 +1,4 @@
-use std::io::{BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
@@ -55,7 +55,7 @@ pub fn server(config: &ServerConfig, permitted_clients: &[String]) -> anyhow::Re
 /// # Errors
 /// Returns `Err` on I/O or codec failure. Validation rejections are sent as
 /// `ServerStatus { ok: false }` and return `Ok(())`.
-pub fn run_server_on<R: Read, W: Write>(
+pub fn run_server_on<R: BufRead, W: Write>(
     config: &ServerConfig,
     permitted_clients: &[&str],
     input: &mut R,

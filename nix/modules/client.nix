@@ -39,7 +39,7 @@ let
         type = listOf str;
         default = [ ];
         description = "Extra options passed to zfs send.";
-        example = [ "-w" ];
+        example = [ "-Lec" ];
       };
     };
   };
@@ -67,6 +67,12 @@ let
         default = true;
         description = "Whether the systemd timer is persistent (catches up missed runs after downtime).";
         example = false;
+      };
+      watchdogSec = mkOption {
+        type = nullOr str;
+        default = "1m";
+        description = "Watchdog timeout for the send service. If the transfer stalls for longer than this, systemd kills and restarts it. Null to disable. Should be set to at least twice the time needed to transfer one 4 MiB chunk.";
+        example = "2h";
       };
     };
   };
@@ -200,13 +206,15 @@ in
           after = [ "network-online.target" ];
           wants = [ "network-online.target" ];
           serviceConfig = {
-            Type = "oneshot";
+            Type = "notify";
             User = cfg.user;
             ExecStart = concatStringsSep " " (
               [ "${cfg.package}/bin/zrb" "send" "--config" "/etc/zrb/client.toml" ]
               ++ job.datasets
               ++ concatMap (r: [ "--remote" r ]) job.remotes
             );
+          } // optionalAttrs (job.watchdogSec != null) {
+            WatchdogSec = job.watchdogSec;
           };
         }
       ) cfg.jobs)
