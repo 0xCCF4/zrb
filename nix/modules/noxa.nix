@@ -53,7 +53,7 @@ in
       # noxa remote targets this node + instance, and populate clients.<sourceName>.allow
       # from their dataset mapping. Manual per-client config (e.g. zfsReceiveOpts)
       # merges in naturally via the NixOS submodule system.
-      config = mkIf (config.noxa.enable && nodeName != null) {
+      config = mkIf (config.noxa.enable) {
         clients = listToAttrs (concatLists (mapAttrsToList (clientNodeName: clientNode:
           let
             clientEnabled = clientNode.configuration.services.zrb.client.enable or false;
