@@ -158,6 +158,7 @@ in
               ${icfg.user} = {
                 isSystemUser = true;
                 group = icfg.group;
+                useDefaultShell = true; # force command override command
               };
             })
           ]

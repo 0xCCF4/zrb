@@ -100,7 +100,10 @@ in
           };
           commands = { pkgs, ... }: [
             {
-              command = "${pkgs.zrb}/bin/zrb server --client ${cfg.sourceName} --config /etc/zrb/${remoteCfg.noxa.serverInstance}/server.toml";
+              command = pkgs.writeShellApplication {
+                name = "zrb-ssh-command-entry-${remoteName}";
+                text = "exec ${pkgs.zrb}/bin/zrb server --client ${cfg.sourceName} --config /etc/zrb/${remoteCfg.noxa.serverInstance}/server.toml";
+              };
               passParameters = false;
             }
           ];

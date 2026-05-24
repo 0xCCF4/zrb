@@ -46,7 +46,7 @@ ssh-keygen -t ed25519 -f ~/.ssh/id_zrb -C "zrb backup key"
 ### 2. Create a dedicated user on the Remote
 
 ```sh
-useradd -r -m -s /usr/sbin/nologin zfsbackup
+useradd -r -m -s /bin/bash zfsbackup
 ```
 
 Copy the public key to the Remote:
