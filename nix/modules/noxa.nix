@@ -3,7 +3,6 @@ with lib;
 let
   cfg = config.services.zrb.client;
   nodes = args.nodes or { };
-  nodeName = args.nodeName or null;
 in
 {
   imports = [ ./client.nix ./server.nix ];
@@ -21,7 +20,8 @@ in
           };
           toUser = mkOption {
             type = str;
-            description = "zrb system user on the Remote. Derived from the Remote's own NixOS config by default.";
+            default = "zrb";
+            description = "zrb system user on the Remote. Defaults to \"zrb\"; override when the server uses a custom user.";
           };
           serverInstance = mkOption {
             type = str;
@@ -31,8 +31,11 @@ in
         };
       };
       config = mkIf config.noxa.enable {
-        noxa.toUser = mkDefault
-          nodes.${config.noxa.toNode}.configuration.services.zrb.server.${config.noxa.serverInstance}.user;
+        noxa.toUser = mkIf
+          (nodes ? ${config.noxa.toNode}
+            && nodes.${config.noxa.toNode}.configuration.services.zrb.server ? ${config.noxa.serverInstance}
+            && nodes.${config.noxa.toNode}.configuration.services.zrb.server.${config.noxa.serverInstance}.enable)
+          (mkDefault nodes.${config.noxa.toNode}.configuration.services.zrb.server.${config.noxa.serverInstance}.user);
         host = mkDefault "zrb-${name}";
       };
     }));
@@ -63,7 +66,7 @@ in
               && r.noxa.serverInstance == name
             ) clientRemotes;
           in
-          if clientNodeName == nodeName || !clientEnabled || matchingRemotes == { }
+          if !clientEnabled || matchingRemotes == { }
           then [ ]
           else
             mapAttrsToList (remoteName: _:
@@ -81,16 +84,18 @@ in
     # Declare a noxa SSH grant for each noxa-enabled remote. noxa distributes
     # the ForceCommand authorized_keys entry to the Remote and the SSH client
     # config to this host.
-    services.noxa.ssh.grants = mapAttrs' (remoteName: remoteCfg:
+    ssh.grants = mapAttrs' (remoteName: remoteCfg:
       nameValuePair "zrb-${remoteName}" {
-        name = "zrb-${remoteName}";
         from = cfg.user;
         to = {
           node = remoteCfg.noxa.toNode;
           user = remoteCfg.noxa.toUser;
         };
-        commands = { pkgs }: [
-          "${pkgs.zrb}/bin/zrb server --client ${cfg.sourceName} --config /etc/zrb/${remoteCfg.noxa.serverInstance}/server.toml"
+        commands = { pkgs, ... }: [
+          {
+            command = "${pkgs.zrb}/bin/zrb server --client ${cfg.sourceName} --config /etc/zrb/${remoteCfg.noxa.serverInstance}/server.toml";
+            passParameters = false;
+          }
         ];
       }
     ) (filterAttrs (_: r: r.noxa.enable) cfg.remotes);

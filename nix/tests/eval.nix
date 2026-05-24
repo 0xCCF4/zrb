@@ -21,10 +21,10 @@ let
       modules = modules ++ baseModules;
     }).config;
 
-  # Minimal stub so eval tests can set services.noxa.ssh.grants without
+  # Minimal stub so eval tests can set ssh.grants without
   # importing the real noxa flake.
   stubNoxaModule = { lib, ... }: {
-    options.services.noxa.ssh.grants = lib.mkOption {
+    options.ssh.grants = lib.mkOption {
       type = lib.types.attrsOf lib.types.anything;
       default = { };
     };
@@ -32,7 +32,10 @@ let
 
   # Fake nodes used to test toUser derivation without a real multi-node eval.
   fakeNodes = {
-    backup-server.configuration.services.zrb.server.main.user = "zrb-remote";
+    backup-server.configuration.services.zrb.server.main = {
+      enable = true;
+      user = "zrb-remote";
+    };
   };
 
   # Fake nodes used to test server-side client auto-population.
@@ -336,22 +339,22 @@ let
 
     # noxa: grant declared with expected name
     (lib.assertMsg
-      (noxaCfg.services.noxa.ssh.grants ? "zrb-backup-server")
+      (noxaCfg.ssh.grants ? "zrb-backup-server")
       "noxa grant \"zrb-backup-server\" not declared")
 
     # noxa: grant from equals client user
     (lib.assertMsg
-      (noxaCfg.services.noxa.ssh.grants."zrb-backup-server".from == "zrb")
+      (noxaCfg.ssh.grants."zrb-backup-server".from == "zrb")
       "noxa grant from does not equal client user \"zrb\"")
 
     # noxa: grant to.node equals toNode
     (lib.assertMsg
-      (noxaCfg.services.noxa.ssh.grants."zrb-backup-server".to.node == "backup-server")
+      (noxaCfg.ssh.grants."zrb-backup-server".to.node == "backup-server")
       "noxa grant to.node does not equal toNode \"backup-server\"")
 
     # noxa: grant to.user derived from nodes config
     (lib.assertMsg
-      (noxaCfg.services.noxa.ssh.grants."zrb-backup-server".to.user == "zrb-remote")
+      (noxaCfg.ssh.grants."zrb-backup-server".to.user == "zrb-remote")
       "noxa grant to.user not derived from nodes config")
 
     # noxa: remote host defaulted to grant name
