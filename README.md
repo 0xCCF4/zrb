@@ -263,7 +263,7 @@ inputs = {
 ```
 
 The module creates the `zrb` system user, writes `/etc/zrb/main/server.toml`, and adds a `ForceCommand`-restricted entry
-to the user's `authorized_keys` for each client key. You still need to grant ZFS permissions manually:
+to the user's `authorized_keys` for each client that has a `publicKey` set. You still need to grant ZFS permissions manually:
 
 ```sh
 zfs allow -u zrb receive,create,mount backup/laptop
@@ -311,6 +311,78 @@ zfs allow -u zrb receive,create,mount backup/laptop
 The module creates the `zrb` system user, writes `/etc/zrb/client.toml`, and registers a `zrb-send-nightly` systemd
 service+timer and a `zrb-prune` service+timer. The SSH key at `sshKey` must be provisioned separately (e.g. via
 `sops-nix` or `agenix`).
+
+### noxa SSH integration
+
+If you use [noxa](https://github.com/0xCCF4/noxa) for SSH key lifecycle management, the optional `nixosModules.noxa`
+module wires up the SSH layer automatically — no manual key generation, no pasting public keys into the server config,
+no hand-written `ForceCommand`.
+
+Import it alongside the client module and set `noxa.enable = true` on the remote:
+
+```nix
+{
+  imports = [
+    inputs.zrb.nixosModules.client
+    inputs.zrb.nixosModules.noxa
+  ];
+
+  services.zrb.client = {
+    enable = true;
+    sourceName = "my-laptop";
+
+    remotes.primary = {
+      # host defaults to the noxa SSH alias; set explicitly to override
+      noxa = {
+        enable = true;
+        toNode = "backup-server";   # noxa node name of the Remote
+        serverInstance = "main";    # matches services.zrb.server.<name> on the Remote
+      };
+    };
+
+    datasets."tank/home".primary = "backup/laptop/home";
+    retention = { recent = 7; weeklyForDays = 30; monthlyForDays = 365; };
+    jobs.nightly = { onCalendar = "daily"; datasets = [ "tank/home" ]; };
+  };
+}
+```
+
+The module declares a noxa SSH grant named `zrb-<remoteName>` for each noxa-enabled remote. noxa then:
+
+- generates the SSH keypair and distributes it via its secrets system
+- writes a `ForceCommand`-restricted `authorized_keys` entry on the Remote
+- configures the SSH client on the Source so `host` resolves correctly
+
+The server-side zrb user is derived automatically from the Remote's NixOS config. Set `noxa.toUser` explicitly if you
+need to override it.
+
+On the Remote, set `noxa.enable = true` on the server instance to have the module auto-discover
+clients from other nodes and populate their `allow` lists from the client's dataset mapping.
+Add `publicKey` is not needed — noxa owns that `authorized_keys` entry.
+
+```nix
+services.zrb.server.main = {
+  enable = true;
+  noxa.enable = true;   # auto-populates clients from nodes
+  retention = { recent = 14; weeklyForDays = 60; monthlyForDays = 730; };
+};
+```
+
+This requires that the Remote's NixOS config is evaluated in a multi-node context (e.g. deploy-rs,
+colmena) that provides the `nodes` and `nodeName` special arguments. The module scans every other
+node for zrb clients whose `noxa.remotes.<name>.toNode` equals this node's `nodeName` and
+`serverInstance` matches the instance name, then derives `clients.<sourceName>.allow` from their
+dataset mapping.
+
+Additional per-client config (e.g. `zfsReceiveOpts`) merges in via the NixOS module system — set
+it alongside the auto-discovered entry:
+
+```nix
+services.zrb.server.main.clients.my-laptop = {
+  # allow is populated automatically; add extra options here
+  zfsReceiveOpts = [ "-c" ];
+};
+```
 
 ## Retention policy
 

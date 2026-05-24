@@ -1,16 +1,55 @@
 { pkgs, lib, nixosModules, nixosSystem }:
 let
+  baseModules = [
+    {
+      boot.loader.grub.enable = false;
+      fileSystems."/" = { device = "none"; fsType = "tmpfs"; };
+      system.stateVersion = "25.11";
+    }
+  ];
+
   mkNixos = modules:
     (nixosSystem {
       inherit (pkgs) system;
-      modules = modules ++ [
-        {
-          boot.loader.grub.enable = false;
-          fileSystems."/" = { device = "none"; fsType = "tmpfs"; };
-          system.stateVersion = "25.11";
-        }
-      ];
+      modules = modules ++ baseModules;
     }).config;
+
+  mkNixosWithArgs = specialArgs: modules:
+    (nixosSystem {
+      inherit (pkgs) system;
+      inherit specialArgs;
+      modules = modules ++ baseModules;
+    }).config;
+
+  # Minimal stub so eval tests can set services.noxa.ssh.grants without
+  # importing the real noxa flake.
+  stubNoxaModule = { lib, ... }: {
+    options.services.noxa.ssh.grants = lib.mkOption {
+      type = lib.types.attrsOf lib.types.anything;
+      default = { };
+    };
+  };
+
+  # Fake nodes used to test toUser derivation without a real multi-node eval.
+  fakeNodes = {
+    backup-server.configuration.services.zrb.server.main.user = "zrb-remote";
+  };
+
+  # Fake nodes used to test server-side client auto-population.
+  fakeNodesServer = {
+    "my-laptop".configuration.services.zrb.client = {
+      enable = true;
+      sourceName = "my-laptop";
+      remotes."backup-server".noxa = {
+        enable = true;
+        toNode = "backup-server";
+        serverInstance = "main";
+        toUser = "zrb";
+      };
+      datasets."tank/home"."backup-server" = "pool/home";
+      datasets."tank/documents"."backup-server" = "pool/docs";
+    };
+  };
 
   # ── Server fixtures ────────────────────────────────────────────────────────
 
@@ -139,6 +178,59 @@ let
     }
   ];
 
+  # ── noxa fixtures ─────────────────────────────────────────────────────────
+
+  # Server with noxa auto-population enabled; clients discovered from fakeNodesServer.
+  serverNoxaDiscoveryCfg = mkNixosWithArgs { nodes = fakeNodesServer; nodeName = "backup-server"; } [
+    nixosModules.noxa
+    stubNoxaModule
+    {
+      services.zrb.server.main = {
+        enable = true;
+        noxa.enable = true;
+        retention = { recent = 3; weeklyForDays = 7; monthlyForDays = 30; };
+      };
+    }
+  ];
+
+  # Server with a client that has no publicKey (noxa manages the key).
+  serverNoxaClientCfg = mkNixos [
+    nixosModules.server
+    {
+      services.zrb.server.main = {
+        enable = true;
+        clients.my-laptop = {
+          allow = [ "pool/home" ];
+          # publicKey omitted — noxa manages this key
+        };
+        retention = { recent = 3; weeklyForDays = 7; monthlyForDays = 30; };
+      };
+    }
+  ];
+
+  # Client with noxa integration enabled for one remote.
+  # nixosModules.noxa already imports client.nix transitively.
+  noxaCfg = mkNixosWithArgs { nodes = fakeNodes; } [
+    nixosModules.noxa
+    stubNoxaModule
+    {
+      services.zrb.client = {
+        enable = true;
+        sourceName = "my-laptop";
+        remotes.backup-server = {
+          noxa = {
+            enable = true;
+            toNode = "backup-server";
+            serverInstance = "main";
+          };
+        };
+        datasets."tank/home"."backup-server" = "pool/home";
+        retention = { recent = 7; weeklyForDays = 30; monthlyForDays = 365; };
+        jobs.daily = { onCalendar = "daily"; datasets = [ "tank/home" ]; };
+      };
+    }
+  ];
+
   # ── Assertions ─────────────────────────────────────────────────────────────
 
   serverAuthKeys = serverCfg.users.users.zrb.openssh.authorizedKeys.keys;
@@ -236,6 +328,53 @@ let
     (lib.assertMsg
       (clientPruneCfg.systemd.timers ? "zrb-prune")
       "zrb-prune timer not generated when prune.onCalendar=\"weekly\"")
+
+    # Server: client with publicKey=null produces no authorized_keys entry
+    (lib.assertMsg
+      (serverNoxaClientCfg.users.users.zrb.openssh.authorizedKeys.keys == [ ])
+      "authorized_keys must be empty when all clients have publicKey=null")
+
+    # noxa: grant declared with expected name
+    (lib.assertMsg
+      (noxaCfg.services.noxa.ssh.grants ? "zrb-backup-server")
+      "noxa grant \"zrb-backup-server\" not declared")
+
+    # noxa: grant from equals client user
+    (lib.assertMsg
+      (noxaCfg.services.noxa.ssh.grants."zrb-backup-server".from == "zrb")
+      "noxa grant from does not equal client user \"zrb\"")
+
+    # noxa: grant to.node equals toNode
+    (lib.assertMsg
+      (noxaCfg.services.noxa.ssh.grants."zrb-backup-server".to.node == "backup-server")
+      "noxa grant to.node does not equal toNode \"backup-server\"")
+
+    # noxa: grant to.user derived from nodes config
+    (lib.assertMsg
+      (noxaCfg.services.noxa.ssh.grants."zrb-backup-server".to.user == "zrb-remote")
+      "noxa grant to.user not derived from nodes config")
+
+    # noxa: remote host defaulted to grant name
+    (lib.assertMsg
+      (noxaCfg.services.zrb.client.remotes."backup-server".host == "zrb-backup-server")
+      "noxa remote host not defaulted to grant name \"zrb-backup-server\"")
+
+    # noxa server discovery: client auto-populated from other node's noxa config
+    (lib.assertMsg
+      (serverNoxaDiscoveryCfg.services.zrb.server.main.clients ? "my-laptop")
+      "noxa server discovery: client my-laptop not auto-populated")
+
+    # noxa server discovery: allow list derived from client dataset mapping
+    (lib.assertMsg
+      (lib.sort lib.lessThan
+        serverNoxaDiscoveryCfg.services.zrb.server.main.clients."my-laptop".allow
+        == [ "pool/docs" "pool/home" ])
+      "noxa server discovery: allow list not derived from client datasets")
+
+    # noxa server discovery: disabled instance does not auto-populate
+    (lib.assertMsg
+      (!(serverNoxaDiscoveryCfg.services.zrb.server ? "other"))
+      "noxa server discovery: unexpected instance created")
   ];
 in
 pkgs.runCommand "module-eval-tests" { } (builtins.deepSeq checks "touch $out\n")

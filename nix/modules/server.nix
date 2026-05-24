@@ -18,8 +18,9 @@ let
         example = [ "-o" "compression=lz4" ];
       };
       publicKey = mkOption {
-        type = str;
-        description = "SSH public key for this client.";
+        type = nullOr str;
+        default = null;
+        description = "SSH public key for this client. Null when key management is delegated to an external tool such as noxa.";
         example = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@host";
       };
     };
@@ -144,7 +145,7 @@ in
             ${icfg.user}.openssh.authorizedKeys.keys =
               mapAttrsToList (clientName: clientCfg:
                 ''command="${icfg.package}/bin/zrb server --client ${clientName} --config /etc/zrb/${name}/server.toml",restrict ${clientCfg.publicKey}''
-              ) icfg.clients;
+              ) (filterAttrs (_: c: c.publicKey != null) icfg.clients);
           }
           (mkIf icfg.createUser {
             ${icfg.user} = {

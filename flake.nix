@@ -32,6 +32,7 @@
       flake = {
         nixosModules.server = import ./nix/modules/server.nix;
         nixosModules.client = import ./nix/modules/client.nix;
+        nixosModules.noxa = import ./nix/modules/noxa.nix;
 
         nixosConfigurations.test-server = inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
