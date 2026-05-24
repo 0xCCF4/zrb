@@ -187,10 +187,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=oneshot
+Type=notify
 ExecStart=/usr/local/bin/zrb send tank/home tank/documents
-# zrb notifies systemd on start and stop — useful with Type=notify if you
-# want the timer to track active send duration instead of one-shot.
+# Kill and restart if a single 4 MiB chunk takes longer than this to transfer.
+WatchdogSec=1m
 ```
 
 **`/etc/systemd/system/zrb-send.timer`**
@@ -299,6 +299,8 @@ zfs allow -u zrb receive,create,mount backup/laptop
     jobs.nightly = {
       onCalendar = "daily";
       datasets = [ "tank/home" "tank/documents" ];
+      # Default is "1m". Increase for very slow links; set null to disable.
+      watchdogSec = "1m";
     };
 
     prune.onCalendar = "weekly";

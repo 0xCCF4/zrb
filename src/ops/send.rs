@@ -1,5 +1,7 @@
-use std::io::{BufReader, IsTerminal, Read, Write};
-use std::process::Command;
+use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::process::{ChildStdin, ChildStdout, Command};
+
+use sd_notify::NotifyState;
 
 use anyhow::Context;
 
@@ -61,13 +63,19 @@ pub fn send(
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn send_to_remote(
+fn run_with_progress<F>(
     latest: &str,
-    local_snaps: &[String],
     remote_cfg: &RemoteConfig,
-    target: &str,
-    client_name: &str,
-) -> anyhow::Result<()> {
+    log_verb: &str,
+    inner: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(
+        &mut BufReader<ChildStdout>,
+        &mut ChildStdin,
+        Option<&mut dyn FnMut(u64, u64)>,
+    ) -> anyhow::Result<()>,
+{
     let tty = std::io::stderr().is_terminal();
     let start = std::time::Instant::now();
     let dataset = latest.split_once('@').map_or(latest, |(d, _)| d);
@@ -80,6 +88,7 @@ fn send_to_remote(
         let fb = &mut final_bytes;
         let mut cb = |bytes: u64, total: u64| {
             *fb = bytes;
+            let _ = sd_notify::notify(&[NotifyState::Watchdog]);
             if tty {
                 let elapsed_s = start.elapsed().as_secs_f64();
                 let speed = if elapsed_s > 0.0 { bytes as f64 / elapsed_s } else { 0.0 };
@@ -99,16 +108,7 @@ fn send_to_remote(
                 }
             }
         };
-        let r = send_on(
-            latest,
-            local_snaps,
-            remote_cfg,
-            target,
-            client_name,
-            &mut reader,
-            &mut conn.stdin,
-            Some(&mut cb),
-        );
+        let r = inner(&mut reader, &mut conn.stdin, Some(&mut cb));
         if tty {
             eprintln!();
         }
@@ -124,10 +124,22 @@ fn send_to_remote(
         } else {
             0.0
         };
-        log::info!("sent {dataset}: {final_bytes} bytes in {elapsed_s:.1}s ({rate_mbs:.2} MB/s)");
+        log::info!("{log_verb} {dataset}: {final_bytes} bytes in {elapsed_s:.1}s ({rate_mbs:.2} MB/s)");
     }
 
     result
+}
+
+fn send_to_remote(
+    latest: &str,
+    local_snaps: &[String],
+    remote_cfg: &RemoteConfig,
+    target: &str,
+    client_name: &str,
+) -> anyhow::Result<()> {
+    run_with_progress(latest, remote_cfg, "sent", |reader, writer, progress| {
+        send_on(latest, local_snaps, remote_cfg, target, client_name, reader, writer, progress)
+    })
 }
 
 /// Run the send protocol over arbitrary `Read`/`Write` streams.
@@ -141,7 +153,7 @@ fn send_to_remote(
 /// # Errors
 /// Returns `Err` on I/O, codec, or remote protocol failure.
 #[allow(clippy::too_many_arguments)]
-pub fn send_on<R: Read, W: Write>(
+pub fn send_on<R: BufRead, W: Write>(
     latest: &str,
     local_snaps: &[String],
     remote_cfg: &RemoteConfig,
@@ -257,7 +269,6 @@ pub fn send_resume(
     Ok(())
 }
 
-#[allow(clippy::cast_precision_loss)]
 fn resume_to_remote(
     latest: &str,
     local_snaps: &[String],
@@ -265,68 +276,9 @@ fn resume_to_remote(
     target: &str,
     client_name: &str,
 ) -> anyhow::Result<()> {
-    let tty = std::io::stderr().is_terminal();
-    let start = std::time::Instant::now();
-    let dataset = latest.split_once('@').map_or(latest, |(d, _)| d);
-
-    let mut conn = transport::connect(remote_cfg, &[])?;
-    let mut reader = BufReader::new(conn.stdout);
-
-    let mut final_bytes = 0u64;
-    let result = {
-        let fb = &mut final_bytes;
-        let mut cb = |bytes: u64, total: u64| {
-            *fb = bytes;
-            if tty {
-                let elapsed_s = start.elapsed().as_secs_f64();
-                let speed = if elapsed_s > 0.0 { bytes as f64 / elapsed_s } else { 0.0 };
-                let mib = bytes as f64 / (1024.0 * 1024.0);
-                let speed_mbs = speed / (1024.0 * 1024.0);
-                if total > 0 {
-                    let total_mib = total as f64 / (1024.0 * 1024.0);
-                    let pct = 100.0 * bytes as f64 / total as f64;
-                    let remaining = total.saturating_sub(bytes) as f64;
-                    let eta_s = if speed > 0.0 { remaining / speed } else { 0.0 };
-                    eprint!(
-                        "\rsent {mib:.1} MiB / ~{total_mib:.0} MiB ({pct:.0}%)  \
-                         {speed_mbs:.1} MB/s  ETA {eta_s:.0}s  "
-                    );
-                } else {
-                    eprint!("\rsent {mib:.1} MiB  {speed_mbs:.1} MB/s  ");
-                }
-            }
-        };
-        let r = resume_on(
-            latest,
-            local_snaps,
-            remote_cfg,
-            target,
-            client_name,
-            &mut reader,
-            &mut conn.stdin,
-            Some(&mut cb),
-        );
-        if tty {
-            eprintln!();
-        }
-        r
-    };
-
-    let _ = conn.child.wait();
-
-    if result.is_ok() {
-        let elapsed_s = start.elapsed().as_secs_f64();
-        let rate_mbs = if elapsed_s > 0.0 {
-            final_bytes as f64 / (1024.0 * 1024.0) / elapsed_s
-        } else {
-            0.0
-        };
-        log::info!(
-            "resumed {dataset}: {final_bytes} bytes in {elapsed_s:.1}s ({rate_mbs:.2} MB/s)"
-        );
-    }
-
-    result
+    run_with_progress(latest, remote_cfg, "resumed", |reader, writer, progress| {
+        resume_on(latest, local_snaps, remote_cfg, target, client_name, reader, writer, progress)
+    })
 }
 
 /// Run the resume protocol over arbitrary `Read`/`Write` streams.
@@ -341,7 +293,7 @@ fn resume_to_remote(
 /// Returns `Err` on I/O, codec, remote protocol failure, or if the newest
 /// snapshot is already present on the Remote.
 #[allow(clippy::too_many_arguments)]
-pub fn resume_on<R: Read, W: Write>(
+pub fn resume_on<R: BufRead, W: Write>(
     latest: &str,
     local_snaps: &[String],
     remote_cfg: &RemoteConfig,

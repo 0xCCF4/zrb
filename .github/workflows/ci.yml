@@ -29,7 +29,7 @@ jobs:
       - name: Install ZFS userland tools
         run: sudo apt-get update -y && sudo apt-get install -y zfsutils-linux
       - name: All tests (including ZFS integration)
-        run: sudo env "PATH=$PATH" cargo test -- --include-ignored
+        run: sudo env "PATH=$PATH" "RUSTUP_HOME=$RUSTUP_HOME" "CARGO_HOME=$CARGO_HOME" cargo test -- --include-ignored
 
   nix-eval:
     name: Nix module eval tests

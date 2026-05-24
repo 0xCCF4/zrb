@@ -129,7 +129,7 @@ fn run() -> anyhow::Result<()> {
         Commands::Send { datasets, remotes, resume } => {
             let cfg_path = cli.config.unwrap_or_else(default_source_config);
             let cfg = config::load_source(&cfg_path)?;
-            let _ = sd_notify::notify(false, &[NotifyState::Ready]);
+            let _ = sd_notify::notify(&[NotifyState::Ready]);
             let ds_refs: Vec<&str> = datasets.iter().map(String::as_str).collect();
             let filter: Option<Vec<&str>> = if remotes.is_empty() {
                 None
@@ -141,7 +141,7 @@ fn run() -> anyhow::Result<()> {
             } else {
                 ops::send::send(&ds_refs, filter.as_deref(), &cfg)?;
             }
-            let _ = sd_notify::notify(false, &[NotifyState::Stopping]);
+            let _ = sd_notify::notify(&[NotifyState::Stopping]);
         }
 
         Commands::Prune { dataset, all } => {
