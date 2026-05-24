@@ -1,4 +1,4 @@
-{ rustPlatform, installShellFiles }:
+{ rustPlatform, installShellFiles, lib }:
 rustPlatform.buildRustPackage {
   pname = "zrb";
   version = (builtins.fromTOML (builtins.readFile ../../Cargo.toml)).package.version;
@@ -21,7 +21,7 @@ rustPlatform.buildRustPackage {
     installManPage zrb.1
   '';
 
-  meta = with pkgs.lib; {
+  meta = with lib; {
     description = "ZFS remote backup - automatic creation and duplication of zfs snapshots ";
     license = licenses.gpl3;
     mainProgram = "zrb";
