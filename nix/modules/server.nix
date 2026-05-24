@@ -118,49 +118,59 @@ in
   };
 
   config = {
-    environment.etc = mapAttrs' (name: icfg:
-      nameValuePair "zrb/${name}/server.toml" {
-        source = toml.generate "zrb-server-${name}.toml" {
-          server.resume_hold_days = icfg.resumeHoldDays;
-          retention = {
-            recent = icfg.retention.recent;
-            weekly_for_days = icfg.retention.weeklyForDays;
-            monthly_for_days = icfg.retention.monthlyForDays;
+    environment.etc = mapAttrs'
+      (name: icfg:
+        nameValuePair "zrb/${name}/server.toml" {
+          source = toml.generate "zrb-server-${name}.toml" {
+            server.resume_hold_days = icfg.resumeHoldDays;
+            retention = {
+              recent = icfg.retention.recent;
+              weekly_for_days = icfg.retention.weeklyForDays;
+              monthly_for_days = icfg.retention.monthlyForDays;
+            };
+            clients = mapAttrs
+              (_: c: {
+                allow = c.allow;
+                zfs_receive_opts = c.zfsReceiveOpts;
+              })
+              icfg.clients;
           };
-          clients = mapAttrs (_: c: {
-            allow = c.allow;
-            zfs_receive_opts = c.zfsReceiveOpts;
-          }) icfg.clients;
-        };
-        user = icfg.user;
-        group = icfg.group;
-        mode = "0640";
-      }
-    ) enabledInstances;
+          user = icfg.user;
+          group = icfg.group;
+          mode = "0640";
+        }
+      )
+      enabledInstances;
 
     users.users = mkMerge (
-      mapAttrsToList (name: icfg:
-        mkMerge [
-          {
-            ${icfg.user}.openssh.authorizedKeys.keys =
-              mapAttrsToList (clientName: clientCfg:
-                ''command="${icfg.package}/bin/zrb server --client ${clientName} --config /etc/zrb/${name}/server.toml",restrict ${clientCfg.publicKey}''
-              ) (filterAttrs (_: c: c.publicKey != null) icfg.clients);
-          }
-          (mkIf icfg.createUser {
-            ${icfg.user} = {
-              isSystemUser = true;
-              group = icfg.group;
-            };
-          })
-        ]
-      ) enabledInstances
+      mapAttrsToList
+        (name: icfg:
+          mkMerge [
+            {
+              ${icfg.user}.openssh.authorizedKeys.keys =
+                mapAttrsToList
+                  (clientName: clientCfg:
+                    ''command="${icfg.package}/bin/zrb server --client ${clientName} --config /etc/zrb/${name}/server.toml",restrict ${clientCfg.publicKey}''
+                  )
+                  (filterAttrs (_: c: c.publicKey != null) icfg.clients);
+            }
+            (mkIf icfg.createUser {
+              ${icfg.user} = {
+                isSystemUser = true;
+                group = icfg.group;
+              };
+            })
+          ]
+        )
+        enabledInstances
     );
 
     users.groups = mkMerge (
-      mapAttrsToList (_: icfg:
-        mkIf icfg.createUser { ${icfg.group} = { }; }
-      ) enabledInstances
+      mapAttrsToList
+        (_: icfg:
+          mkIf icfg.createUser { ${icfg.group} = { }; }
+        )
+        enabledInstances
     );
   };
 }

@@ -371,7 +371,7 @@ let
     (lib.assertMsg
       (lib.sort lib.lessThan
         serverNoxaDiscoveryCfg.services.zrb.server.main.clients."my-laptop".allow
-        == [ "pool/docs" "pool/home" ])
+      == [ "pool/docs" "pool/home" ])
       "noxa server discovery: allow list not derived from client datasets")
 
     # noxa server discovery: disabled instance does not auto-populate

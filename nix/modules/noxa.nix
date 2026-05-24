@@ -54,28 +54,34 @@ in
       # from their dataset mapping. Manual per-client config (e.g. zfsReceiveOpts)
       # merges in naturally via the NixOS submodule system.
       config = mkIf (config.noxa.enable) {
-        clients = listToAttrs (concatLists (mapAttrsToList (clientNodeName: clientNode:
-          let
-            clientEnabled = clientNode.configuration.services.zrb.client.enable or false;
-            clientRemotes = clientNode.configuration.services.zrb.client.remotes or { };
-            clientDatasets = clientNode.configuration.services.zrb.client.datasets or { };
-            clientSourceName = clientNode.configuration.services.zrb.client.sourceName or "";
-            matchingRemotes = filterAttrs (_: r:
-              (r ? noxa) && r.noxa.enable
-              && r.noxa.toNode == nodeName
-              && r.noxa.serverInstance == name
-            ) clientRemotes;
-          in
-          if !clientEnabled || matchingRemotes == { }
-          then [ ]
-          else
-            mapAttrsToList (remoteName: _:
-              nameValuePair clientSourceName {
-                allow = mapAttrsToList (_: remoteMap: remoteMap.${remoteName})
-                  (filterAttrs (_: remoteMap: remoteMap ? ${remoteName}) clientDatasets);
-              }
-            ) matchingRemotes
-        ) nodes));
+        clients = listToAttrs (concatLists (mapAttrsToList
+          (clientNodeName: clientNode:
+            let
+              clientEnabled = clientNode.configuration.services.zrb.client.enable or false;
+              clientRemotes = clientNode.configuration.services.zrb.client.remotes or { };
+              clientDatasets = clientNode.configuration.services.zrb.client.datasets or { };
+              clientSourceName = clientNode.configuration.services.zrb.client.sourceName or "";
+              matchingRemotes = filterAttrs
+                (_: r:
+                  (r ? noxa) && r.noxa.enable
+                  && r.noxa.toNode == nodeName
+                  && r.noxa.serverInstance == name
+                )
+                clientRemotes;
+            in
+            if !clientEnabled || matchingRemotes == { }
+            then [ ]
+            else
+              mapAttrsToList
+                (remoteName: _:
+                  nameValuePair clientSourceName {
+                    allow = mapAttrsToList (_: remoteMap: remoteMap.${remoteName})
+                      (filterAttrs (_: remoteMap: remoteMap ? ${remoteName}) clientDatasets);
+                  }
+                )
+                matchingRemotes
+          )
+          nodes));
       };
     }));
   };
@@ -84,20 +90,22 @@ in
     # Declare a noxa SSH grant for each noxa-enabled remote. noxa distributes
     # the ForceCommand authorized_keys entry to the Remote and the SSH client
     # config to this host.
-    ssh.grants = mapAttrs' (remoteName: remoteCfg:
-      nameValuePair "zrb-${remoteName}" {
-        from = cfg.user;
-        to = {
-          node = remoteCfg.noxa.toNode;
-          user = remoteCfg.noxa.toUser;
-        };
-        commands = { pkgs, ... }: [
-          {
-            command = "${pkgs.zrb}/bin/zrb server --client ${cfg.sourceName} --config /etc/zrb/${remoteCfg.noxa.serverInstance}/server.toml";
-            passParameters = false;
-          }
-        ];
-      }
-    ) (filterAttrs (_: r: r.noxa.enable) cfg.remotes);
+    ssh.grants = mapAttrs'
+      (remoteName: remoteCfg:
+        nameValuePair "zrb-${remoteName}" {
+          from = cfg.user;
+          to = {
+            node = remoteCfg.noxa.toNode;
+            user = remoteCfg.noxa.toUser;
+          };
+          commands = { pkgs, ... }: [
+            {
+              command = "${pkgs.zrb}/bin/zrb server --client ${cfg.sourceName} --config /etc/zrb/${remoteCfg.noxa.serverInstance}/server.toml";
+              passParameters = false;
+            }
+          ];
+        }
+      )
+      (filterAttrs (_: r: r.noxa.enable) cfg.remotes);
   };
 }

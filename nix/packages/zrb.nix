@@ -20,4 +20,10 @@ rustPlatform.buildRustPackage {
     $out/bin/zrb man > zrb.1
     installManPage zrb.1
   '';
+
+  meta = with pkgs.lib; {
+    description = "ZFS remote backup - automatic creation and duplication of zfs snapshots ";
+    license = licenses.gpl3;
+    mainProgram = "zrb";
+  };
 }

@@ -183,14 +183,16 @@ in
   config = mkIf cfg.enable {
     environment.etc."zrb/client.toml".source = toml.generate "zrb-client.toml" {
       source.name = cfg.sourceName;
-      remotes = mapAttrs (_: r: {
-        host = r.host;
-        ssh_opts = r.sshOpts;
-        zfs_send_opts = r.zfsSendOpts;
-      }
-      // optionalAttrs (r.port != null) { port = r.port; }
-      // optionalAttrs (r.user != null) { user = r.user; }
-      // optionalAttrs (r.sshKey != null) { ssh_key = r.sshKey; }) cfg.remotes;
+      remotes = mapAttrs
+        (_: r: {
+          host = r.host;
+          ssh_opts = r.sshOpts;
+          zfs_send_opts = r.zfsSendOpts;
+        }
+        // optionalAttrs (r.port != null) { port = r.port; }
+        // optionalAttrs (r.user != null) { user = r.user; }
+        // optionalAttrs (r.sshKey != null) { ssh_key = r.sshKey; })
+        cfg.remotes;
       datasets = cfg.datasets;
       retention = {
         recent = cfg.retention.recent;
@@ -200,24 +202,26 @@ in
     };
 
     systemd.services = mkMerge [
-      (mapAttrs' (name: job:
-        nameValuePair "zrb-send-${name}" {
-          description = "zrb send job '${name}'";
-          after = [ "network-online.target" ];
-          wants = [ "network-online.target" ];
-          serviceConfig = {
-            Type = "notify";
-            User = cfg.user;
-            ExecStart = concatStringsSep " " (
-              [ "${cfg.package}/bin/zrb" "send" "--config" "/etc/zrb/client.toml" ]
-              ++ job.datasets
-              ++ concatMap (r: [ "--remote" r ]) job.remotes
-            );
-          } // optionalAttrs (job.watchdogSec != null) {
-            WatchdogSec = job.watchdogSec;
-          };
-        }
-      ) cfg.jobs)
+      (mapAttrs'
+        (name: job:
+          nameValuePair "zrb-send-${name}" {
+            description = "zrb send job '${name}'";
+            after = [ "network-online.target" ];
+            wants = [ "network-online.target" ];
+            serviceConfig = {
+              Type = "notify";
+              User = cfg.user;
+              ExecStart = concatStringsSep " " (
+                [ "${cfg.package}/bin/zrb" "send" "--config" "/etc/zrb/client.toml" ]
+                  ++ job.datasets
+                  ++ concatMap (r: [ "--remote" r ]) job.remotes
+              );
+            } // optionalAttrs (job.watchdogSec != null) {
+              WatchdogSec = job.watchdogSec;
+            };
+          }
+        )
+        cfg.jobs)
       (mkIf (cfg.prune.onCalendar != null) {
         zrb-prune = {
           description = "zrb prune --all";
@@ -231,16 +235,18 @@ in
     ];
 
     systemd.timers = mkMerge [
-      (mapAttrs' (name: job:
-        nameValuePair "zrb-send-${name}" {
-          description = "Timer for zrb send job '${name}'";
-          wantedBy = [ "timers.target" ];
-          timerConfig = {
-            OnCalendar = job.onCalendar;
-            Persistent = job.persistent;
-          };
-        }
-      ) cfg.jobs)
+      (mapAttrs'
+        (name: job:
+          nameValuePair "zrb-send-${name}" {
+            description = "Timer for zrb send job '${name}'";
+            wantedBy = [ "timers.target" ];
+            timerConfig = {
+              OnCalendar = job.onCalendar;
+              Persistent = job.persistent;
+            };
+          }
+        )
+        cfg.jobs)
       (mkIf (cfg.prune.onCalendar != null) {
         zrb-prune = {
           description = "Timer for zrb prune --all";
