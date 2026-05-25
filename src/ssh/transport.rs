@@ -1,6 +1,7 @@
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::Stdio;
 
 use thiserror::Error;
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use crate::config::RemoteConfig;
 
@@ -22,14 +23,17 @@ pub struct SshConnection {
 /// Spawn `ssh` to `remote` with optional extra arguments and return piped stdio.
 ///
 /// The caller reads/writes the zrb Protocol directly over `stdout`/`stdin`.
-/// Call `child.wait()` after the session ends to reap the process.
+/// Call `child.wait().await` after the session ends to reap the process.
 ///
 /// # Errors
 /// Returns [`TransportError::Spawn`] if the `ssh` process cannot be started.
 ///
 /// # Panics
 /// Never panics — stdin/stdout are always present because `Stdio::piped()` is set unconditionally.
-pub fn connect(remote: &RemoteConfig, extra_opts: &[String]) -> Result<SshConnection, TransportError> {
+pub fn connect(
+    remote: &RemoteConfig,
+    extra_opts: &[String],
+) -> Result<SshConnection, TransportError> {
     let mut cmd = Command::new("ssh");
     if let Some(port) = remote.port {
         cmd.arg("-p").arg(port.to_string());
@@ -61,7 +65,11 @@ pub fn connect(remote: &RemoteConfig, extra_opts: &[String]) -> Result<SshConnec
     })?;
     let stdin = child.stdin.take().expect("stdin piped");
     let stdout = child.stdout.take().expect("stdout piped");
-    Ok(SshConnection { stdin, stdout, child })
+    Ok(SshConnection {
+        stdin,
+        stdout,
+        child,
+    })
 }
 
 #[cfg(test)]
@@ -86,6 +94,9 @@ mod tests {
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "No such file"),
         };
         let msg = err.to_string();
-        assert!(msg.starts_with("SSH connect to nas.local: "), "unexpected format: {msg}");
+        assert!(
+            msg.starts_with("SSH connect to nas.local: "),
+            "unexpected format: {msg}"
+        );
     }
 }

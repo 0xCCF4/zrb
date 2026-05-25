@@ -1,6 +1,6 @@
+use crate::snapshot::naming;
 use chrono::{DateTime, Datelike, Duration, IsoWeek, Utc};
 use serde::{Deserialize, Serialize};
-use crate::snapshot::naming;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RetentionConfig {
@@ -152,9 +152,9 @@ mod tests {
         // Recent = 1 (just today), weekly window = 7 days, monthly = 60 days
         // Put 2 snapshots in the same month but outside the weekly window
         let snaps = vec![
-            snap("pool/data", 1, now),   // recent
-            snap("pool/data", 35, now),  // monthly window, first in April
-            snap("pool/data", 40, now),  // monthly window, same month as 35d ago → deleted
+            snap("pool/data", 1, now),  // recent
+            snap("pool/data", 35, now), // monthly window, first in April
+            snap("pool/data", 40, now), // monthly window, same month as 35d ago → deleted
         ];
         let (keep, delete) = apply(&snaps, now, &cfg(1, 7, 60));
         assert_eq!(delete.len(), 1);
@@ -166,9 +166,9 @@ mod tests {
         let now = now();
         // monthly window = 60 days, so 366+ days ago is in yearly window
         let snaps = vec![
-            snap("pool/data", 1, now),    // recent
-            snap("pool/data", 366, now),  // yearly — first in that year
-            snap("pool/data", 370, now),  // yearly — same year → deleted
+            snap("pool/data", 1, now),   // recent
+            snap("pool/data", 366, now), // yearly — first in that year
+            snap("pool/data", 370, now), // yearly — same year → deleted
         ];
         let (keep, delete) = apply(&snaps, now, &cfg(1, 7, 60));
         assert_eq!(delete.len(), 1);

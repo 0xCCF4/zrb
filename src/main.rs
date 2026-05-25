@@ -63,6 +63,10 @@ enum Commands {
         /// Errors if the newest local snapshot is already present on the Remote.
         #[arg(long)]
         resume: bool,
+
+        /// Send to each Remote one at a time instead of in parallel.
+        #[arg(long)]
+        sequential: bool,
     },
 
     /// Prune zrb-managed snapshots according to the Retention Policy.
@@ -88,9 +92,7 @@ enum Commands {
     },
 
     #[command(hide = true)]
-    Completions {
-        shell: ShellChoice,
-    },
+    Completions { shell: ShellChoice },
 
     #[command(hide = true)]
     Man,
@@ -130,8 +132,9 @@ fn print_grouped(groups: &[(String, Vec<String>)]) {
     }
 }
 
+#[tokio::main]
 #[allow(clippy::too_many_lines)]
-fn run() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let log_level = if cli.verbose { "debug" } else { "info" };
@@ -162,7 +165,12 @@ fn run() -> anyhow::Result<()> {
             print_grouped(&groups);
         }
 
-        Commands::Send { datasets, remotes, resume } => {
+        Commands::Send {
+            datasets,
+            remotes,
+            resume,
+            sequential,
+        } => {
             for ds in &datasets {
                 validate_dataset(ds)?;
             }
@@ -176,14 +184,18 @@ fn run() -> anyhow::Result<()> {
                 Some(remotes.iter().map(String::as_str).collect())
             };
             if resume {
-                ops::send::send_resume(&ds_refs, filter.as_deref(), &cfg)?;
+                ops::send::send_resume(&ds_refs, filter.as_deref(), &cfg, sequential).await?;
             } else {
-                ops::send::send(&ds_refs, filter.as_deref(), &cfg)?;
+                ops::send::send(&ds_refs, filter.as_deref(), &cfg, sequential).await?;
             }
             let _ = sd_notify::notify(&[NotifyState::Stopping]);
         }
 
-        Commands::Prune { dataset, all, recursive } => {
+        Commands::Prune {
+            dataset,
+            all,
+            recursive,
+        } => {
             if let Some(ds) = &dataset {
                 validate_dataset(ds)?;
             }
@@ -242,11 +254,21 @@ fn run() -> anyhow::Result<()> {
             let name = cmd.get_name().to_owned();
             let stdout = &mut std::io::stdout();
             match shell {
-                ShellChoice::Bash => clap_complete::generate(clap_complete::Shell::Bash, &mut cmd, name, stdout),
-                ShellChoice::Zsh => clap_complete::generate(clap_complete::Shell::Zsh, &mut cmd, name, stdout),
-                ShellChoice::Fish => clap_complete::generate(clap_complete::Shell::Fish, &mut cmd, name, stdout),
-                ShellChoice::Elvish => clap_complete::generate(clap_complete::Shell::Elvish, &mut cmd, name, stdout),
-                ShellChoice::Nushell => clap_complete::generate(clap_complete_nushell::Nushell, &mut cmd, name, stdout),
+                ShellChoice::Bash => {
+                    clap_complete::generate(clap_complete::Shell::Bash, &mut cmd, name, stdout)
+                }
+                ShellChoice::Zsh => {
+                    clap_complete::generate(clap_complete::Shell::Zsh, &mut cmd, name, stdout)
+                }
+                ShellChoice::Fish => {
+                    clap_complete::generate(clap_complete::Shell::Fish, &mut cmd, name, stdout)
+                }
+                ShellChoice::Elvish => {
+                    clap_complete::generate(clap_complete::Shell::Elvish, &mut cmd, name, stdout)
+                }
+                ShellChoice::Nushell => {
+                    clap_complete::generate(clap_complete_nushell::Nushell, &mut cmd, name, stdout)
+                }
             }
         }
 
@@ -318,7 +340,11 @@ mod tests {
     fn send_resume_flag_parses() {
         let cli = Cli::try_parse_from(["zrb", "send", "--resume", "tank/home"]);
         assert!(cli.is_ok(), "zrb send --resume <dataset> should parse");
-        if let Ok(Cli { command: Commands::Send { resume, .. }, .. }) = cli {
+        if let Ok(Cli {
+            command: Commands::Send { resume, .. },
+            ..
+        }) = cli
+        {
             assert!(resume, "--resume should be true");
         }
     }
@@ -332,6 +358,27 @@ mod tests {
     }
 
     #[test]
+    fn send_sequential_flag_parses() {
+        let cli = Cli::try_parse_from(["zrb", "send", "--sequential", "tank/home"]);
+        assert!(cli.is_ok(), "zrb send --sequential <dataset> should parse");
+        if let Ok(Cli {
+            command: Commands::Send { sequential, .. },
+            ..
+        }) = cli
+        {
+            assert!(sequential, "--sequential should be true");
+        }
+    }
+
+    #[test]
+    fn send_sequential_flag_absent_defaults_false() {
+        let cli = Cli::try_parse_from(["zrb", "send", "tank/home"]).unwrap();
+        if let Commands::Send { sequential, .. } = cli.command {
+            assert!(!sequential, "--sequential should default to false");
+        }
+    }
+
+    #[test]
     fn prune_all_flag_parses() {
         let cli = Cli::try_parse_from(["zrb", "prune", "--all"]);
         assert!(cli.is_ok(), "zrb prune --all should parse successfully");
@@ -340,7 +387,10 @@ mod tests {
     #[test]
     fn prune_dataset_alone_parses() {
         let cli = Cli::try_parse_from(["zrb", "prune", "tank/home"]);
-        assert!(cli.is_ok(), "zrb prune <dataset> should still parse successfully");
+        assert!(
+            cli.is_ok(),
+            "zrb prune <dataset> should still parse successfully"
+        );
     }
 
     #[test]
@@ -352,14 +402,21 @@ mod tests {
     #[test]
     fn prune_dataset_and_all_conflict() {
         let cli = Cli::try_parse_from(["zrb", "prune", "tank/home", "--all"]);
-        assert!(cli.is_err(), "zrb prune <dataset> --all should be a CLI error");
+        assert!(
+            cli.is_err(),
+            "zrb prune <dataset> --all should be a CLI error"
+        );
     }
 
     #[test]
     fn list_no_args_parses() {
         let cli = Cli::try_parse_from(["zrb", "list"]);
         assert!(cli.is_ok(), "zrb list with no args should parse");
-        if let Ok(Cli { command: Commands::List { dataset, recursive }, .. }) = cli {
+        if let Ok(Cli {
+            command: Commands::List { dataset, recursive },
+            ..
+        }) = cli
+        {
             assert!(dataset.is_none());
             assert!(!recursive);
         }
@@ -394,13 +451,21 @@ mod tests {
     #[test]
     fn list_recursive_without_dataset_parses() {
         let cli = Cli::try_parse_from(["zrb", "list", "--recursive"]);
-        assert!(cli.is_ok(), "zrb list --recursive with no dataset should parse");
+        assert!(
+            cli.is_ok(),
+            "zrb list --recursive with no dataset should parse"
+        );
     }
 
     #[test]
     fn prune_recursive_with_dataset_parses() {
         let cli = Cli::try_parse_from(["zrb", "prune", "tank", "--recursive"]).unwrap();
-        if let Commands::Prune { dataset, recursive, all } = cli.command {
+        if let Commands::Prune {
+            dataset,
+            recursive,
+            all,
+        } = cli.command
+        {
             assert_eq!(dataset.as_deref(), Some("tank"));
             assert!(recursive);
             assert!(!all);
@@ -418,13 +483,19 @@ mod tests {
     #[test]
     fn prune_recursive_without_dataset_errors() {
         let cli = Cli::try_parse_from(["zrb", "prune", "--recursive"]);
-        assert!(cli.is_err(), "zrb prune --recursive without a dataset should be a CLI error");
+        assert!(
+            cli.is_err(),
+            "zrb prune --recursive without a dataset should be a CLI error"
+        );
     }
 
     #[test]
     fn prune_recursive_and_all_conflict() {
         let cli = Cli::try_parse_from(["zrb", "prune", "--all", "--recursive"]);
-        assert!(cli.is_err(), "zrb prune --all --recursive should be a CLI error");
+        assert!(
+            cli.is_err(),
+            "zrb prune --all --recursive should be a CLI error"
+        );
     }
 
     #[test]
