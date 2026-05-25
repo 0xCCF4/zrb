@@ -59,6 +59,7 @@ pub fn server(config: &ServerConfig, permitted_clients: &[String]) -> anyhow::Re
 /// # Errors
 /// Returns `Err` on I/O or codec failure. Validation rejections are sent as
 /// `ServerStatus { ok: false }` and return `Ok(())`.
+#[allow(clippy::too_many_lines)]
 pub async fn run_server_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     config: &ServerConfig,
     permitted_clients: &[&str],
@@ -137,6 +138,14 @@ pub async fn run_server_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     )
     .await?;
     output.flush().await?;
+
+    let ready = codec::decode_client_ready(input)
+        .await
+        .context("reading ClientReady")?;
+    if !ready.ok {
+        log::info!("client declined to send: {}", ready.message);
+        return Ok(());
+    }
 
     let mut recv = zfs::receive(&request.target, &client_cfg.zfs_receive_opts)
         .context("spawning zfs receive")?;

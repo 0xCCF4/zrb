@@ -9,15 +9,39 @@ pub struct RetentionConfig {
     pub monthly_for_days: i64,
 }
 
+/// Why a snapshot is kept by the Retention Policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeepReason {
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+    Unmanaged,
+}
+
+impl std::fmt::Display for KeepReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Daily => write!(f, "daily"),
+            Self::Weekly => write!(f, "weekly"),
+            Self::Monthly => write!(f, "monthly"),
+            Self::Yearly => write!(f, "yearly"),
+            Self::Unmanaged => write!(f, "unmanaged"),
+        }
+    }
+}
+
 /// Partition `snapshots` into `(keep, delete)` according to the tiered policy.
 ///
-/// Snapshots not managed by zrb (no valid timestamp) are kept unconditionally.
+/// Each kept snapshot is paired with the reason it was retained.
+/// Snapshots not managed by zrb (no valid timestamp) are kept unconditionally
+/// with reason [`KeepReason::Unmanaged`].
 #[must_use]
 pub fn apply(
     snapshots: &[String],
     now: DateTime<Utc>,
     config: &RetentionConfig,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<(String, KeepReason)>, Vec<String>) {
     let mut parsed: Vec<(String, Option<DateTime<Utc>>)> = snapshots
         .iter()
         .map(|s| (s.clone(), naming::parse(s)))
@@ -42,17 +66,17 @@ pub fn apply(
     let mut seen_months: std::collections::HashSet<(i32, u32)> = std::collections::HashSet::new();
     let mut seen_years: std::collections::HashSet<i32> = std::collections::HashSet::new();
 
-    let mut keep = Vec::new();
+    let mut keep: Vec<(String, KeepReason)> = Vec::new();
     let mut delete = Vec::new();
 
     for (idx, (name, ts_opt)) in parsed.iter().enumerate() {
         if recent_set.contains(&idx) {
-            keep.push(name.clone());
+            keep.push((name.clone(), KeepReason::Daily));
             continue;
         }
         let Some(ts) = ts_opt else {
             // Non-zrb snapshot: keep unconditionally.
-            keep.push(name.clone());
+            keep.push((name.clone(), KeepReason::Unmanaged));
             continue;
         };
 
@@ -60,7 +84,7 @@ pub fn apply(
             // Weekly window.
             let bucket = (ts.year(), ts.iso_week());
             if seen_weeks.insert(bucket) {
-                keep.push(name.clone());
+                keep.push((name.clone(), KeepReason::Weekly));
             } else {
                 delete.push(name.clone());
             }
@@ -68,14 +92,14 @@ pub fn apply(
             // Monthly window.
             let bucket = (ts.year(), ts.month());
             if seen_months.insert(bucket) {
-                keep.push(name.clone());
+                keep.push((name.clone(), KeepReason::Monthly));
             } else {
                 delete.push(name.clone());
             }
         } else {
             // Yearly window.
             if seen_years.insert(ts.year()) {
-                keep.push(name.clone());
+                keep.push((name.clone(), KeepReason::Yearly));
             } else {
                 delete.push(name.clone());
             }
@@ -107,6 +131,10 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 5, 22, 12, 0, 0).unwrap()
     }
 
+    fn keep_names(keep: &[(String, KeepReason)]) -> Vec<&str> {
+        keep.iter().map(|(s, _)| s.as_str()).collect()
+    }
+
     #[test]
     fn empty_list_returns_empty_vecs() {
         let (keep, delete) = apply(&[], now(), &cfg(7, 30, 365));
@@ -121,6 +149,7 @@ mod tests {
         let (keep, delete) = apply(&snaps, now, &cfg(7, 30, 365));
         assert_eq!(keep.len(), 3);
         assert!(delete.is_empty());
+        assert!(keep.iter().all(|(_, r)| *r == KeepReason::Daily));
     }
 
     #[test]
@@ -135,13 +164,13 @@ mod tests {
     #[test]
     fn beyond_recent_weekly_window_one_per_week() {
         let now = now();
-        // 7 snapshots in the Recent bucket (days 1-7)
+        // 7 snapshots in the Daily bucket (days 1-7)
         // 2 extra snapshots from 8 and 9 days ago — same ISO week → only 1 survives
         let mut snaps: Vec<String> = (1..=7).map(|d| snap("pool/data", d, now)).collect();
         snaps.push(snap("pool/data", 8, now));
         snaps.push(snap("pool/data", 9, now));
         let (keep, delete) = apply(&snaps, now, &cfg(7, 30, 365));
-        // 7 recent + 1 weekly survivor = 8 kept; 1 deleted
+        // 7 daily + 1 weekly survivor = 8 kept; 1 deleted
         assert_eq!(delete.len(), 1);
         assert_eq!(keep.len(), 8);
     }
@@ -149,16 +178,17 @@ mod tests {
     #[test]
     fn monthly_window_one_per_month() {
         let now = now();
-        // Recent = 1 (just today), weekly window = 7 days, monthly = 60 days
+        // Daily = 1 (just today), weekly window = 7 days, monthly = 60 days
         // Put 2 snapshots in the same month but outside the weekly window
         let snaps = vec![
-            snap("pool/data", 1, now),  // recent
+            snap("pool/data", 1, now),  // daily
             snap("pool/data", 35, now), // monthly window, first in April
             snap("pool/data", 40, now), // monthly window, same month as 35d ago → deleted
         ];
         let (keep, delete) = apply(&snaps, now, &cfg(1, 7, 60));
         assert_eq!(delete.len(), 1);
         assert_eq!(keep.len(), 2);
+        let _ = keep_names(&keep);
     }
 
     #[test]
@@ -166,7 +196,7 @@ mod tests {
         let now = now();
         // monthly window = 60 days, so 366+ days ago is in yearly window
         let snaps = vec![
-            snap("pool/data", 1, now),   // recent
+            snap("pool/data", 1, now),   // daily
             snap("pool/data", 366, now), // yearly — first in that year
             snap("pool/data", 370, now), // yearly — same year → deleted
         ];
@@ -189,5 +219,22 @@ mod tests {
         // Either way it must not be deleted (it's the only one in its bucket).
         assert!(delete.is_empty(), "boundary snapshot should not be deleted");
         assert_eq!(keep.len(), 2);
+    }
+
+    #[test]
+    fn keep_reasons_daily_weekly_monthly_yearly() {
+        let now = now();
+        let snaps = vec![
+            snap("pool/data", 1, now),   // daily
+            snap("pool/data", 10, now),  // weekly (within 30d weekly window, cfg below)
+            snap("pool/data", 40, now),  // monthly (31-365d monthly window)
+            snap("pool/data", 400, now), // yearly (>365d)
+        ];
+        let (keep, _delete) = apply(&snaps, now, &cfg(1, 30, 365));
+        let reasons: Vec<&KeepReason> = keep.iter().map(|(_, r)| r).collect();
+        assert!(reasons.contains(&&KeepReason::Daily));
+        assert!(reasons.contains(&&KeepReason::Weekly));
+        assert!(reasons.contains(&&KeepReason::Monthly));
+        assert!(reasons.contains(&&KeepReason::Yearly));
     }
 }

@@ -19,7 +19,7 @@ use zrb::ops::list as ops_list;
 use zrb::ops::prune as ops_prune;
 use zrb::ops::send::send_on;
 use zrb::ops::server::run_server_on;
-use zrb::protocol::codec::{self, ClientHello};
+use zrb::protocol::codec::{self, ClientHello, ClientReady};
 use zrb::retention::policy::RetentionConfig;
 use zrb::zfs::client as zfs_client;
 
@@ -162,6 +162,16 @@ fn partial_run_send(latest: &str, target_dataset: &str, client_name: &str, srv_c
             hello.resume_token.is_none(),
             "fresh target has no resume token before interruption"
         );
+
+        codec::encode_client_ready(
+            &ClientReady {
+                ok: true,
+                message: "ok".to_owned(),
+            },
+            &mut client_write,
+        )
+        .await
+        .expect("encode ClientReady");
 
         // Stream exactly one 4 MiB protocol chunk. The server writes the raw ZFS bytes to
         // `zfs receive -s`, which then sees EOF (truncated stream), exits non-zero, and
@@ -336,7 +346,7 @@ fn prune_keeps_recent_deletes_oldest() {
         weekly_for_days: 7,
         monthly_for_days: 30,
     };
-    let result = ops_prune::prune(&src_ds, &retention, None).expect("prune");
+    let result = ops_prune::prune(&src_ds, &retention, None, false, false).expect("prune");
 
     let remaining = ops_list::list(&src_ds).expect("list after prune");
     // 3 recent + 1 yearly rep = 4 kept; Jan-02 and Jan-03 deleted

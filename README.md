@@ -1,8 +1,19 @@
 # zrb — ZFS Remote Backup
 
-`zrb` is a lightweight tool for pushing ZFS snapshots from a Source host (e.g. a laptop) to a Remote server over SSH. It
-handles snapshot creation, incremental transfers, interrupted-transfer resumption, and snapshot pruning — all driven
-from the Source side.
+`zrb` automates what raw `zfs send` leaves to you: incremental base selection, interrupted-transfer resumption,
+snapshot management, and multi-remote delivery. NixOS modules for both server and client included — drop in and go.
+
+One command does the work:
+
+```sh
+zrb send tank/home  # sends to all configured remotes
+# - creates a new snapshot
+# - queries each remote for its existing snapshots
+# - selects the base that minimizes transferred data
+# - resumes any interrupted transfer, then streams the delta
+```
+
+Pruning runs independently on each host according to its own retention policy.
 
 ## How it works
 
@@ -11,13 +22,19 @@ Source (laptop)  ──SSH──►  Remote (backup server)
   zrb send                    zrb server (ForceCommand)
 ```
 
-The Source creates a snapshot, opens an SSH connection, performs a structured handshake to negotiate an incremental
-base, and streams the snapshot to the Remote via `zfs send | zfs receive`. The Remote never initiates contact. If a
-transfer is interrupted mid-stream, the next `zrb send` resumes from where it left off using ZFS native resume tokens.
+`zrb send` works in two phases over a single SSH connection:
+
+1. **Handshake** — the server sends its snapshot list; the client compares it against its
+   own and picks the base that minimises the transfer size.
+2. **Transfer** — the client runs `zfs send` and pipes the stream to `zfs receive` on the
+   server. If a previous transfer was interrupted, the client resumes it via ZFS native
+   resume tokens before starting the next send.
+
+All connections are push from the client — the server runs only as an SSH `ForceCommand`.
 
 ## Requirements
 
-- Linux with OpenZFS (`zfs` and `zpool` in `PATH`)
+- Linux with ZFS executables (`zfs` and `zpool` in `PATH`)
 - SSH access from Source to Remote
 - Rust toolchain (for source builds) or Nix
 
@@ -49,7 +66,6 @@ Delegate the minimum permissions to the user that will run `zrb` on each dataset
 
 ```sh
 zfs allow -u <user> snapshot,send,destroy tank/home
-zfs allow -u <user> snapshot,send,destroy tank/documents
 ```
 
 `snapshot` and `send` are required for `zrb send`; `destroy` is required for `zrb prune`.
@@ -68,7 +84,7 @@ ssh-copy-id -i ~/.ssh/id_zrb.pub zfsbackup@backup.example.com
 
 ### 4. Configure SSH ForceCommand on the Remote
 
-Edit `/home/zfsbackup/.ssh/authorized_keys` so that the key runs `zrb server` instead of a shell:
+Edit `/home/zfsbackup/.ssh/authorized_keys` so that the key always runs `zrb server` instead of a shell:
 
 ```
 command="zrb server --client my-laptop",restrict ssh-ed25519 AAAA... zrb backup key
@@ -87,7 +103,8 @@ zfs allow -u <user> receive,create,mount backup/laptop
 
 Keep the delegation as narrow as possible — per-dataset subtree, not the whole pool.
 
-**Do not create the target datasets manually.** `zrb` creates them automatically on the first transfer via `zfs receive`. Pre-existing datasets will cause `zfs receive` to fail.
+**Do not create the target datasets manually.** `zrb` creates them automatically on the first transfer via
+`zfs receive`. Pre-existing datasets will cause `zfs receive` to fail.
 
 ### 6. Write the Remote config
 
@@ -155,7 +172,7 @@ zrb send tank/home tank/documents
 zrb send tank/home --remote primary
 ```
 
-If the previous transfer was interrupted, `zrb send` resumes it automatically before starting new sends.
+If the previous transfer was interrupted, `zrb send --resume` resumes it automatically.
 
 ### `zrb snapshot <dataset>...`
 
@@ -177,11 +194,24 @@ zrb list tank/home
 
 ### `zrb prune <dataset>`
 
-Deletes snapshots that fall outside the Retention Policy. Runs locally — Source and Remote prune independently.
+Deletes snapshots that fall outside the Retention Policy. (Does only affect local zfs pool)
 
 ```sh
 zrb prune tank/home
+zrb prune tank/home --recursive
+
+# Preview what would be deleted without touching anything
+zrb prune tank/home --dry-run
+
+# Abort a stuck in-progress resume transfer and prune anyway
+zrb prune tank/home --abort-resume
 ```
+
+`--dry-run` prints each snapshot with its keep reason (`daily`, `weekly`, `monthly`, `yearly`) or a deletion marker. No
+ZFS mutations are made.
+
+`--abort-resume` overrides the `resume_hold_days` guard on the Remote: it discards the pending resume token and prunes
+regardless. Use when a partially-received transfer is no longer worth resuming.
 
 ### `zrb server --client <name>...`
 
@@ -201,6 +231,7 @@ Wants=network-online.target
 
 [Service]
 Type=notify
+User=<user>
 ExecStart=/usr/local/bin/zrb send tank/home tank/documents
 # Kill and restart if a single 4 MiB chunk takes longer than this to transfer.
 WatchdogSec=1m
@@ -276,11 +307,8 @@ inputs = {
 ```
 
 The module creates the `zrb` system user, writes `/etc/zrb/main/server.toml`, and adds a `ForceCommand`-restricted entry
-to the user's `authorized_keys` for each client that has a `publicKey` set. You still need to grant ZFS permissions manually:
-
-```sh
-zfs allow -u zrb receive,create,mount backup/laptop
-```
+to the user's `authorized_keys` for each client that has a `publicKey` set. You still need to grant ZFS permissions
+imperatively.
 
 ### Client
 
@@ -321,7 +349,7 @@ zfs allow -u zrb receive,create,mount backup/laptop
 }
 ```
 
-The module creates the `zrb` system user, writes `/etc/zrb/client.toml`, and registers a `zrb-send-nightly` systemd
+The module creates the `zrb` system user, writes `/etc/zrb/client.toml`, and registers a `zrb-send-<name>` systemd
 service+timer and a `zrb-prune` service+timer. The SSH key at `sshKey` must be provisioned separately (e.g. via
 `sops-nix` or `agenix`).
 
@@ -329,14 +357,13 @@ service+timer and a `zrb-prune` service+timer. The SSH key at `sshKey` must be p
 
 If you use [noxa](https://github.com/0xCCF4/noxa) for SSH key lifecycle management, the optional `nixosModules.noxa`
 module wires up the SSH layer automatically — no manual key generation, no pasting public keys into the server config,
-no hand-written `ForceCommand`.
+no handwritten `ForceCommand` or manual SSH keys.
 
-Import it alongside the client module and set `noxa.enable = true` on the remote:
+Import it instead of the client/server module and set `noxa.enable = true` on the remote:
 
 ```nix
 {
   imports = [
-    inputs.zrb.nixosModules.client
     inputs.zrb.nixosModules.noxa
   ];
 
@@ -354,8 +381,9 @@ Import it alongside the client module and set `noxa.enable = true` on the remote
     };
 
     datasets."tank/home".primary = "backup/laptop/home";
+    
     retention = { recent = 7; weeklyForDays = 30; monthlyForDays = 365; };
-    jobs.nightly = { onCalendar = "daily"; datasets = [ "tank/home" ]; };
+    jobs.daily = { onCalendar = "daily"; datasets = [ "tank/home" ]; };
   };
 }
 ```
@@ -380,12 +408,6 @@ services.zrb.server.main = {
   retention = { recent = 14; weeklyForDays = 60; monthlyForDays = 730; };
 };
 ```
-
-This requires that the Remote's NixOS config is evaluated in a multi-node context (e.g. deploy-rs,
-colmena) that provides the `nodes` and `nodeName` special arguments. The module scans every other
-node for zrb clients whose `noxa.remotes.<name>.toNode` equals this node's `nodeName` and
-`serverInstance` matches the instance name, then derives `clients.<sourceName>.allow` from their
-dataset mapping.
 
 Additional per-client config (e.g. `zfsReceiveOpts`) merges in via the NixOS module system — set
 it alongside the auto-discovered entry:
@@ -416,14 +438,18 @@ Only snapshots with the `zrb-` prefix are managed. Any snapshots you created man
 
 ## Security model
 
-Three independent layers protect the Remote:
+**SSH as the transport** — SSH provides an encrypted channel and key-based authentication. The pre-shared SSH key is
+the only credential the client needs; no passwords, no tokens.
 
-1. **ZFS delegation** (`zfs allow`) — the OS enforces which datasets the backup user may write to, regardless of what
-   `zrb` does. This is the authoritative boundary.
-2. **SSH key → client name binding** — each `authorized_keys` entry restricts which client names may connect with that
-   key. A compromised key cannot impersonate unlisted clients.
-3. **Server config allowlist** — `[clients.<name>].allow` maps each client to its permitted receive targets, catching
-   misconfiguration early with a clear error message.
+**`ForceCommand` invokes the remote `zrb` instance** — instead of opening a shell, the SSH key directly starts
+`zrb server` on the Remote. The client never gets a shell; the connection is purpose-built for the backup protocol.
+
+**`--client` binds a key to specific source hosts** — each `authorized_keys` entry declares which client names it may
+serve. A compromised key cannot impersonate a client (identified by its public key) name that is not listed, limiting
+the blast radius to the datasets that client is permitted to write.
+
+**ZFS delegation is the hard boundary** — `zfs allow` enforces at the OS level which datasets the backup user may
+receive into, regardless of what `zrb` does.
 
 ## Snapshot naming
 
@@ -434,7 +460,6 @@ tank/home@zrb-2026-05-22T14:30:00Z
 ```
 
 `zrb` ignores all snapshots that do not match this prefix.
-
 
 ## On the use of AI
 

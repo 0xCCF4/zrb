@@ -82,6 +82,14 @@ enum Commands {
         /// Also prune child datasets. Requires DATASET.
         #[arg(long, short = 'r', conflicts_with = "all", requires = "dataset")]
         recursive: bool,
+
+        /// Preview what would be pruned without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Abort any in-progress resume transfer and prune anyway.
+        #[arg(long)]
+        abort_resume: bool,
     },
 
     /// Run in server mode (invoked via SSH `ForceCommand`).
@@ -118,6 +126,46 @@ fn default_source_config() -> PathBuf {
 
 fn default_server_config() -> PathBuf {
     xdg_config_home().join("zrb/server.toml")
+}
+
+enum DryRunEntry<'a> {
+    Keep(&'a str, &'a zrb::retention::policy::KeepReason),
+    Delete(&'a str),
+}
+
+fn print_prune_dry_run(groups: &[(String, ops::prune::PruneResult)]) {
+    use zrb::snapshot::naming;
+
+    for (i, (dataset, result)) in groups.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        println!("{dataset}");
+        if result.resume_skipped {
+            println!("  \u{23f8} skipped \u{2014} resume transfer in progress");
+            continue;
+        }
+        let mut entries: Vec<(Option<chrono::DateTime<chrono::Utc>>, DryRunEntry<'_>)> = result
+            .kept
+            .iter()
+            .map(|(s, r)| (naming::parse(s), DryRunEntry::Keep(s, r)))
+            .chain(
+                result
+                    .deleted
+                    .iter()
+                    .map(|s| (naming::parse(s), DryRunEntry::Delete(s))),
+            )
+            .collect();
+        entries.sort_by_key(|(ts, _)| *ts);
+        for (_, entry) in &entries {
+            match entry {
+                DryRunEntry::Keep(name, reason) => {
+                    println!("  \u{2713} {:<9} {name}", reason.to_string());
+                }
+                DryRunEntry::Delete(name) => println!("  \u{2717}           {name}"),
+            }
+        }
+    }
 }
 
 fn print_grouped(groups: &[(String, Vec<String>)]) {
@@ -195,6 +243,8 @@ async fn run() -> anyhow::Result<()> {
             dataset,
             all,
             recursive,
+            dry_run,
+            abort_resume,
         } => {
             if let Some(ds) = &dataset {
                 validate_dataset(ds)?;
@@ -209,35 +259,45 @@ async fn run() -> anyhow::Result<()> {
                 })
                 .or_else(|_| config::load_source(&cfg_path).map(|c| (c.retention, None)))?;
             if all {
-                let results = ops::prune::prune_all(&retention, hold_days)?;
-                for (ds, result) in &results {
-                    log::info!(
-                        "pruned {}: kept {}, deleted {}",
-                        ds,
-                        result.kept.len(),
-                        result.deleted.len()
-                    );
-                    for s in &result.deleted {
-                        log::debug!("deleted {s}");
+                let results =
+                    ops::prune::prune_all(&retention, hold_days, dry_run, abort_resume)?;
+                if dry_run {
+                    print_prune_dry_run(&results);
+                } else {
+                    for (ds, result) in &results {
+                        log::info!(
+                            "pruned {}: kept {}, deleted {}",
+                            ds,
+                            result.kept.len(),
+                            result.deleted.len()
+                        );
+                        for s in &result.deleted {
+                            log::debug!("deleted {s}");
+                        }
                     }
                 }
             } else {
                 let dataset = dataset.expect("required_unless_present = all");
                 let results = if recursive {
-                    ops::prune::prune_recursive(&dataset, &retention, hold_days)?
+                    ops::prune::prune_recursive(&dataset, &retention, hold_days, dry_run, abort_resume)?
                 } else {
-                    let result = ops::prune::prune(&dataset, &retention, hold_days)?;
+                    let result =
+                        ops::prune::prune(&dataset, &retention, hold_days, dry_run, abort_resume)?;
                     vec![(dataset, result)]
                 };
-                for (ds, result) in &results {
-                    log::info!(
-                        "pruned {}: kept {}, deleted {}",
-                        ds,
-                        result.kept.len(),
-                        result.deleted.len()
-                    );
-                    for s in &result.deleted {
-                        log::debug!("deleted {s}");
+                if dry_run {
+                    print_prune_dry_run(&results);
+                } else {
+                    for (ds, result) in &results {
+                        log::info!(
+                            "pruned {}: kept {}, deleted {}",
+                            ds,
+                            result.kept.len(),
+                            result.deleted.len()
+                        );
+                        for s in &result.deleted {
+                            log::debug!("deleted {s}");
+                        }
                     }
                 }
             }
@@ -255,19 +315,19 @@ async fn run() -> anyhow::Result<()> {
             let stdout = &mut std::io::stdout();
             match shell {
                 ShellChoice::Bash => {
-                    clap_complete::generate(clap_complete::Shell::Bash, &mut cmd, name, stdout)
+                    clap_complete::generate(clap_complete::Shell::Bash, &mut cmd, name, stdout);
                 }
                 ShellChoice::Zsh => {
-                    clap_complete::generate(clap_complete::Shell::Zsh, &mut cmd, name, stdout)
+                    clap_complete::generate(clap_complete::Shell::Zsh, &mut cmd, name, stdout);
                 }
                 ShellChoice::Fish => {
-                    clap_complete::generate(clap_complete::Shell::Fish, &mut cmd, name, stdout)
+                    clap_complete::generate(clap_complete::Shell::Fish, &mut cmd, name, stdout);
                 }
                 ShellChoice::Elvish => {
-                    clap_complete::generate(clap_complete::Shell::Elvish, &mut cmd, name, stdout)
+                    clap_complete::generate(clap_complete::Shell::Elvish, &mut cmd, name, stdout);
                 }
                 ShellChoice::Nushell => {
-                    clap_complete::generate(clap_complete_nushell::Nushell, &mut cmd, name, stdout)
+                    clap_complete::generate(clap_complete_nushell::Nushell, &mut cmd, name, stdout);
                 }
             }
         }
@@ -464,6 +524,7 @@ mod tests {
             dataset,
             recursive,
             all,
+            ..
         } = cli.command
         {
             assert_eq!(dataset.as_deref(), Some("tank"));
@@ -512,6 +573,54 @@ mod tests {
     #[test]
     fn validate_dataset_accepts_bare_pool() {
         assert!(validate_dataset("tank").is_ok());
+    }
+
+    #[test]
+    fn prune_dry_run_flag_parses() {
+        let cli = Cli::try_parse_from(["zrb", "prune", "tank/home", "--dry-run"]);
+        assert!(cli.is_ok(), "zrb prune <dataset> --dry-run should parse");
+        if let Ok(Cli {
+            command: Commands::Prune { dry_run, .. },
+            ..
+        }) = cli
+        {
+            assert!(dry_run, "--dry-run should be true");
+        }
+    }
+
+    #[test]
+    fn prune_dry_run_with_all_parses() {
+        let cli = Cli::try_parse_from(["zrb", "prune", "--all", "--dry-run"]);
+        assert!(cli.is_ok(), "zrb prune --all --dry-run should parse");
+    }
+
+    #[test]
+    fn prune_abort_resume_flag_parses() {
+        let cli = Cli::try_parse_from(["zrb", "prune", "tank/home", "--abort-resume"]);
+        assert!(cli.is_ok(), "zrb prune <dataset> --abort-resume should parse");
+        if let Ok(Cli {
+            command: Commands::Prune { abort_resume, .. },
+            ..
+        }) = cli
+        {
+            assert!(abort_resume, "--abort-resume should be true");
+        }
+    }
+
+    #[test]
+    fn prune_abort_resume_defaults_false() {
+        let cli = Cli::try_parse_from(["zrb", "prune", "tank/home"]).unwrap();
+        if let Commands::Prune { abort_resume, .. } = cli.command {
+            assert!(!abort_resume, "--abort-resume should default to false");
+        }
+    }
+
+    #[test]
+    fn prune_dry_run_defaults_false() {
+        let cli = Cli::try_parse_from(["zrb", "prune", "tank/home"]).unwrap();
+        if let Commands::Prune { dry_run, .. } = cli.command {
+            assert!(!dry_run, "--dry-run should default to false");
+        }
     }
 
     #[test]

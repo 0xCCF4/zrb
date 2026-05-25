@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 
 use crate::ops::list as ops_list;
-use crate::retention::policy::{RetentionConfig, apply};
+use crate::retention::policy::{KeepReason, RetentionConfig, apply};
 use crate::zfs::client;
 
 /// Apply the Retention Policy to `dataset` and all child datasets.
@@ -12,19 +12,23 @@ pub fn prune_recursive(
     dataset: &str,
     config: &RetentionConfig,
     hold_days: Option<u32>,
+    dry_run: bool,
+    abort_resume: bool,
 ) -> anyhow::Result<Vec<(String, PruneResult)>> {
     ops_list::datasets_matching(&client::discover_datasets()?, dataset)
         .into_iter()
         .map(|ds| {
-            let result = prune(&ds, config, hold_days)?;
+            let result = prune(&ds, config, hold_days, dry_run, abort_resume)?;
             Ok((ds, result))
         })
         .collect()
 }
 
 pub struct PruneResult {
-    pub kept: Vec<String>,
+    pub kept: Vec<(String, KeepReason)>,
     pub deleted: Vec<String>,
+    /// True when pruning was skipped because a resume transfer is in progress.
+    pub resume_skipped: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,12 +73,14 @@ pub(crate) fn resume_decision(
 pub fn prune_all(
     config: &RetentionConfig,
     hold_days: Option<u32>,
+    dry_run: bool,
+    abort_resume: bool,
 ) -> anyhow::Result<Vec<(String, PruneResult)>> {
     let datasets = client::discover_datasets()?;
     datasets
         .into_iter()
         .map(|ds| {
-            let result = prune(&ds, config, hold_days)?;
+            let result = prune(&ds, config, hold_days, dry_run, abort_resume)?;
             Ok((ds, result))
         })
         .collect()
@@ -83,10 +89,11 @@ pub fn prune_all(
 /// Apply the Retention Policy to `dataset` and destroy out-of-policy snapshots.
 ///
 /// If the dataset has an unexpired resume token (`Wait`), snapshot deletion is
-/// skipped to avoid invalidating the in-progress receive.  The resume hold
-/// period is enforced server-side via `zrb:resume-since`; prune only aborts
-/// tokens that have exceeded `hold_days`.  With `hold_days = None` (source
-/// side) the token is always removed.
+/// skipped to avoid invalidating the in-progress receive — unless `abort_resume`
+/// is true, in which case the token is aborted and pruning proceeds regardless.
+/// With `dry_run = true`, no ZFS mutations are performed; the function returns
+/// what *would* happen.  A dry-run `Wait` (without `abort_resume`) sets
+/// `resume_skipped = true` on the returned result.
 ///
 /// Only zrb-managed snapshots are affected; others are ignored by `ops::list`.
 ///
@@ -96,38 +103,52 @@ pub fn prune(
     dataset: &str,
     config: &RetentionConfig,
     hold_days: Option<u32>,
+    dry_run: bool,
+    abort_resume: bool,
 ) -> anyhow::Result<PruneResult> {
     let has_token = client::get_resume_token(dataset)?.is_some();
     let since = client::get_resume_since(dataset)?;
     let now = Utc::now();
     let had_since = since.is_some();
 
-    match resume_decision(has_token, since, now, hold_days) {
+    let mut decision = resume_decision(has_token, since, now, hold_days);
+    if abort_resume && decision == ResumeDecision::Wait {
+        decision = ResumeDecision::Expire;
+    }
+    log::debug!("{dataset}: resume decision: {decision:?}");
+    match decision {
         ResumeDecision::Idle => {
-            if had_since {
+            if had_since && !dry_run {
                 client::clear_resume_since(dataset)?;
             }
         }
         ResumeDecision::Wait => {
-            // Resume in progress and hold period not elapsed; skip snapshot pruning
-            // to avoid invalidating the resume token.
             return Ok(PruneResult {
                 kept: vec![],
                 deleted: vec![],
+                resume_skipped: true,
             });
         }
         ResumeDecision::Expire => {
-            client::abort_resume(dataset)?;
-            client::clear_resume_since(dataset)?;
+            if !dry_run {
+                client::abort_resume(dataset)?;
+                client::clear_resume_since(dataset)?;
+            }
         }
     }
 
     let snapshots = ops_list::list(dataset)?;
     let (kept, deleted) = apply(&snapshots, Utc::now(), config);
-    for snap in &deleted {
-        client::destroy_snapshot(snap)?;
+    if !dry_run {
+        for snap in &deleted {
+            client::destroy_snapshot(snap)?;
+        }
     }
-    Ok(PruneResult { kept, deleted })
+    Ok(PruneResult {
+        kept,
+        deleted,
+        resume_skipped: false,
+    })
 }
 
 #[cfg(test)]
