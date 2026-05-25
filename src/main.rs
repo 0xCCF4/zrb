@@ -259,8 +259,7 @@ async fn run() -> anyhow::Result<()> {
                 })
                 .or_else(|_| config::load_source(&cfg_path).map(|c| (c.retention, None)))?;
             if all {
-                let results =
-                    ops::prune::prune_all(&retention, hold_days, dry_run, abort_resume)?;
+                let results = ops::prune::prune_all(&retention, hold_days, dry_run, abort_resume)?;
                 if dry_run {
                     print_prune_dry_run(&results);
                 } else {
@@ -279,7 +278,13 @@ async fn run() -> anyhow::Result<()> {
             } else {
                 let dataset = dataset.expect("required_unless_present = all");
                 let results = if recursive {
-                    ops::prune::prune_recursive(&dataset, &retention, hold_days, dry_run, abort_resume)?
+                    ops::prune::prune_recursive(
+                        &dataset,
+                        &retention,
+                        hold_days,
+                        dry_run,
+                        abort_resume,
+                    )?
                 } else {
                     let result =
                         ops::prune::prune(&dataset, &retention, hold_days, dry_run, abort_resume)?;
@@ -306,7 +311,7 @@ async fn run() -> anyhow::Result<()> {
         Commands::Server { clients } => {
             let cfg_path = cli.config.unwrap_or_else(default_server_config);
             let cfg = config::load_server(&cfg_path)?;
-            ops::server::server(&cfg, &clients)?;
+            ops::server::server(&cfg, &clients).await?;
         }
 
         Commands::Completions { shell } => {
@@ -597,7 +602,10 @@ mod tests {
     #[test]
     fn prune_abort_resume_flag_parses() {
         let cli = Cli::try_parse_from(["zrb", "prune", "tank/home", "--abort-resume"]);
-        assert!(cli.is_ok(), "zrb prune <dataset> --abort-resume should parse");
+        assert!(
+            cli.is_ok(),
+            "zrb prune <dataset> --abort-resume should parse"
+        );
         if let Ok(Cli {
             command: Commands::Prune { abort_resume, .. },
             ..

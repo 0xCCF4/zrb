@@ -189,8 +189,7 @@ async fn dispatch_tasks(
 }
 
 fn style_waiting() -> ProgressStyle {
-    ProgressStyle::with_template("  {prefix:.dim}  waiting")
-        .expect("static template is valid")
+    ProgressStyle::with_template("  {prefix:.dim}  waiting").expect("static template is valid")
 }
 
 fn style_active_bounded() -> ProgressStyle {
@@ -215,8 +214,7 @@ fn style_done() -> ProgressStyle {
 }
 
 fn style_failed() -> ProgressStyle {
-    ProgressStyle::with_template("  {prefix:.red.bold}  failed")
-        .expect("static template is valid")
+    ProgressStyle::with_template("  {prefix:.red.bold}  failed").expect("static template is valid")
 }
 
 #[allow(clippy::cast_precision_loss)]

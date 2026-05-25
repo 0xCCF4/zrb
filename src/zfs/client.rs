@@ -78,7 +78,8 @@ pub fn destroy_snapshot(snapshot: &str) -> Result<(), ClientError> {
     assert!(
         snapshot
             .split_once('@')
-            .is_some_and(|(_, name)| name.starts_with("zrb-")) && snapshot.split('@').count() == 2,
+            .is_some_and(|(_, name)| name.starts_with("zrb-"))
+            && snapshot.split('@').count() == 2,
         "Guardrail tripped: not a zrb snapshot: {snapshot}"
     );
     log::trace!("zfs destroy {snapshot}");
