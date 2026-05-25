@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::future::Future;
-use std::io::IsTerminal;
 
 use anyhow::Context;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use sd_notify::NotifyState;
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::task::JoinSet;
@@ -138,30 +138,24 @@ async fn dispatch_tasks(
     sequential: bool,
     is_resume: bool,
 ) {
+    let mp = MultiProgress::new();
+    let max_name_len = tasks.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
+    let bars: Vec<ProgressBar> = tasks
+        .iter()
+        .map(|(name, _, _)| {
+            let bar = mp.add(ProgressBar::new(0));
+            bar.set_style(style_waiting());
+            bar.set_prefix(format!("{name:<max_name_len$}"));
+            bar
+        })
+        .collect();
+
     if sequential {
-        for (remote_name, remote_cfg, target) in &tasks {
+        for ((remote_name, remote_cfg, target), bar) in tasks.iter().zip(bars) {
             let result = if is_resume {
-                resume_to_remote(
-                    latest,
-                    local_snaps,
-                    remote_cfg,
-                    target,
-                    client_name,
-                    remote_name,
-                    true,
-                )
-                .await
+                resume_to_remote(latest, local_snaps, remote_cfg, target, client_name, bar).await
             } else {
-                send_to_remote(
-                    latest,
-                    local_snaps,
-                    remote_cfg,
-                    target,
-                    client_name,
-                    remote_name,
-                    true,
-                )
-                .await
+                send_to_remote(latest, local_snaps, remote_cfg, target, client_name, bar).await
             };
             if let Err(e) = result {
                 let verb = if is_resume { "resume" } else { "send" };
@@ -170,7 +164,7 @@ async fn dispatch_tasks(
         }
     } else {
         let mut set: JoinSet<(String, anyhow::Result<()>)> = JoinSet::new();
-        for (remote_name, remote_cfg, target) in tasks {
+        for ((remote_name, remote_cfg, target), bar) in tasks.into_iter().zip(bars) {
             let (latest, local_snaps, cname) = (
                 latest.to_owned(),
                 local_snaps.to_vec(),
@@ -178,27 +172,9 @@ async fn dispatch_tasks(
             );
             set.spawn(async move {
                 let result = if is_resume {
-                    resume_to_remote(
-                        &latest,
-                        &local_snaps,
-                        &remote_cfg,
-                        &target,
-                        &cname,
-                        &remote_name,
-                        false,
-                    )
-                    .await
+                    resume_to_remote(&latest, &local_snaps, &remote_cfg, &target, &cname, bar).await
                 } else {
-                    send_to_remote(
-                        &latest,
-                        &local_snaps,
-                        &remote_cfg,
-                        &target,
-                        &cname,
-                        &remote_name,
-                        false,
-                    )
-                    .await
+                    send_to_remote(&latest, &local_snaps, &remote_cfg, &target, &cname, bar).await
                 };
                 (remote_name, result)
             });
@@ -212,41 +188,35 @@ async fn dispatch_tasks(
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
-fn show_progress(
-    sequential: bool,
-    remote_name: &str,
-    bytes: u64,
-    total: u64,
-    start: std::time::Instant,
-    tty: bool,
-) {
-    let elapsed_s = start.elapsed().as_secs_f64();
-    let speed = if elapsed_s > 0.0 {
-        bytes as f64 / elapsed_s
-    } else {
-        0.0
-    };
-    let mib = bytes as f64 / (1024.0 * 1024.0);
-    let speed_mbs = speed / (1024.0 * 1024.0);
-    if sequential {
-        if tty {
-            if total > 0 {
-                let total_mib = total as f64 / (1024.0 * 1024.0);
-                let pct = 100.0 * bytes as f64 / total as f64;
-                let remaining = total.saturating_sub(bytes) as f64;
-                let eta_s = if speed > 0.0 { remaining / speed } else { 0.0 };
-                eprint!(
-                    "\rsent {mib:.1} MiB / ~{total_mib:.0} MiB ({pct:.0}%)  \
-                     {speed_mbs:.1} MB/s  ETA {eta_s:.0}s  "
-                );
-            } else {
-                eprint!("\rsent {mib:.1} MiB  {speed_mbs:.1} MB/s  ");
-            }
-        }
-    } else {
-        eprintln!("[{remote_name}]  {mib:.1} MiB  {speed_mbs:.1} MB/s");
-    }
+fn style_waiting() -> ProgressStyle {
+    ProgressStyle::with_template("  {prefix:.dim}  waiting")
+        .expect("static template is valid")
+}
+
+fn style_active_bounded() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "  {prefix:.cyan.bold}  [{bar:40.cyan/white}] \
+         {decimal_bytes}/{decimal_total_bytes}  {decimal_bytes_per_sec}  ETA {eta}",
+    )
+    .expect("static template is valid")
+    .progress_chars("=>-")
+}
+
+fn style_active_unbounded() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "  {prefix:.cyan.bold}  {spinner}  {decimal_bytes}  {decimal_bytes_per_sec}",
+    )
+    .expect("static template is valid")
+}
+
+fn style_done() -> ProgressStyle {
+    ProgressStyle::with_template("  {prefix:.green.bold}  {decimal_bytes} {msg}")
+        .expect("static template is valid")
+}
+
+fn style_failed() -> ProgressStyle {
+    ProgressStyle::with_template("  {prefix:.red.bold}  failed")
+        .expect("static template is valid")
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -256,10 +226,8 @@ async fn send_to_remote(
     remote_cfg: &RemoteConfig,
     target: &str,
     client_name: &str,
-    remote_name: &str,
-    sequential: bool,
+    bar: ProgressBar,
 ) -> anyhow::Result<()> {
-    let tty = std::io::stderr().is_terminal();
     let start = std::time::Instant::now();
     let dataset = latest.split_once('@').map_or(latest, |(d, _)| d);
 
@@ -267,13 +235,24 @@ async fn send_to_remote(
     let mut reader = tokio::io::BufReader::new(conn.stdout);
 
     let mut final_bytes = 0u64;
+    let mut style_set = false;
     let result = {
         let fb = &mut final_bytes;
-        let rname = remote_name.to_owned();
+        let ss = &mut style_set;
+        let bar_cb = bar.clone();
         let cb: &mut (dyn FnMut(u64, u64) + Send) = &mut move |bytes: u64, total: u64| {
             *fb = bytes;
             let _ = sd_notify::notify(&[NotifyState::Watchdog]);
-            show_progress(sequential, &rname, bytes, total, start, tty);
+            if !*ss {
+                if total > 0 {
+                    bar_cb.set_length(total);
+                    bar_cb.set_style(style_active_bounded());
+                } else {
+                    bar_cb.set_style(style_active_unbounded());
+                }
+                *ss = true;
+            }
+            bar_cb.set_position(bytes);
         };
         send_on(
             latest,
@@ -288,20 +267,23 @@ async fn send_to_remote(
         .await
     };
 
-    if sequential && tty {
-        eprintln!();
-    }
     drop(conn.stdin);
     let _ = conn.child.wait().await;
 
+    let elapsed_s = start.elapsed().as_secs_f64();
+    let rate_mbs = if elapsed_s > 0.0 {
+        final_bytes as f64 / 1_000_000.0 / elapsed_s
+    } else {
+        0.0
+    };
     if result.is_ok() {
-        let elapsed_s = start.elapsed().as_secs_f64();
-        let rate_mbs = if elapsed_s > 0.0 {
-            final_bytes as f64 / (1024.0 * 1024.0) / elapsed_s
-        } else {
-            0.0
-        };
+        bar.set_style(style_done());
+        bar.set_position(final_bytes);
+        bar.finish_with_message(format!("({elapsed_s:.1}s)"));
         log::info!("sent {dataset}: {final_bytes} bytes in {elapsed_s:.1}s ({rate_mbs:.2} MB/s)");
+    } else {
+        bar.set_style(style_failed());
+        bar.abandon();
     }
 
     result
@@ -314,10 +296,8 @@ async fn resume_to_remote(
     remote_cfg: &RemoteConfig,
     target: &str,
     client_name: &str,
-    remote_name: &str,
-    sequential: bool,
+    bar: ProgressBar,
 ) -> anyhow::Result<()> {
-    let tty = std::io::stderr().is_terminal();
     let start = std::time::Instant::now();
     let dataset = latest.split_once('@').map_or(latest, |(d, _)| d);
 
@@ -325,13 +305,24 @@ async fn resume_to_remote(
     let mut reader = tokio::io::BufReader::new(conn.stdout);
 
     let mut final_bytes = 0u64;
+    let mut style_set = false;
     let result = {
         let fb = &mut final_bytes;
-        let rname = remote_name.to_owned();
+        let ss = &mut style_set;
+        let bar_cb = bar.clone();
         let cb: &mut (dyn FnMut(u64, u64) + Send) = &mut move |bytes: u64, total: u64| {
             *fb = bytes;
             let _ = sd_notify::notify(&[NotifyState::Watchdog]);
-            show_progress(sequential, &rname, bytes, total, start, tty);
+            if !*ss {
+                if total > 0 {
+                    bar_cb.set_length(total);
+                    bar_cb.set_style(style_active_bounded());
+                } else {
+                    bar_cb.set_style(style_active_unbounded());
+                }
+                *ss = true;
+            }
+            bar_cb.set_position(bytes);
         };
         resume_on(
             latest,
@@ -346,22 +337,25 @@ async fn resume_to_remote(
         .await
     };
 
-    if sequential && tty {
-        eprintln!();
-    }
     drop(conn.stdin);
     let _ = conn.child.wait().await;
 
+    let elapsed_s = start.elapsed().as_secs_f64();
+    let rate_mbs = if elapsed_s > 0.0 {
+        final_bytes as f64 / 1_000_000.0 / elapsed_s
+    } else {
+        0.0
+    };
     if result.is_ok() {
-        let elapsed_s = start.elapsed().as_secs_f64();
-        let rate_mbs = if elapsed_s > 0.0 {
-            final_bytes as f64 / (1024.0 * 1024.0) / elapsed_s
-        } else {
-            0.0
-        };
+        bar.set_style(style_done());
+        bar.set_position(final_bytes);
+        bar.finish_with_message(format!("({elapsed_s:.1}s)"));
         log::info!(
             "resumed {dataset}: {final_bytes} bytes in {elapsed_s:.1}s ({rate_mbs:.2} MB/s)"
         );
+    } else {
+        bar.set_style(style_failed());
+        bar.abandon();
     }
 
     result
@@ -417,9 +411,10 @@ pub async fn send_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     // that snapshots which exist on both sides are recognised as common.
     let stream_res = if let Some(ref token) = hello.resume_token {
         log::debug!("resume token present; using zfs send -t");
+        let size = estimate_resume_size(token, &remote_cfg.zfs_send_opts).await;
         zfs::send_resume(token, &remote_cfg.zfs_send_opts)
             .context("zfs send -t")
-            .map(|out| (out, 0u64))
+            .map(|out| (out, size))
     } else {
         let server_names: std::collections::HashSet<&str> = hello
             .snapshots
@@ -555,9 +550,10 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
 
     let stream_res = if let Some(ref token) = hello.resume_token {
         log::debug!("resume token present; using zfs send -t");
+        let size = estimate_resume_size(token, &remote_cfg.zfs_send_opts).await;
         zfs::send_resume(token, &remote_cfg.zfs_send_opts)
             .context("zfs send -t")
-            .map(|out| (out, 0u64))
+            .map(|out| (out, size))
     } else {
         let latest_suffix = latest.split_once('@').map_or(latest, |(_, n)| n);
         let on_server = hello
@@ -661,6 +657,28 @@ fn remote_receive_error(msg: &str) -> anyhow::Error {
         "remote error: {msg}\nhint: the target dataset may need `zfs rollback` or the \
          snapshots may conflict with the send stream; check `zfs allow` delegation on the server"
     )
+}
+
+fn estimate_from_output(output: &str) -> u64 {
+    estimator::parse_estimated_size(output).unwrap_or(0)
+}
+
+async fn estimate_resume_size(token: &str, opts: &[String]) -> u64 {
+    let Ok(output) = tokio::process::Command::new("zfs")
+        .args(["send", "-n", "-v", "-t", token])
+        .args(opts)
+        .output()
+        .await
+    else {
+        return 0;
+    };
+    // ZFS writes verbose stats to stderr; combine with stdout for compatibility
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout),
+    );
+    estimate_from_output(&combined)
 }
 
 async fn estimate_size(candidate: &str, latest: &str, opts: &[String]) -> anyhow::Result<u64> {
@@ -1006,6 +1024,75 @@ mod tests {
         assert!(
             err.to_string().contains("ghost"),
             "expected remote name in error: {err}"
+        );
+    }
+
+    #[test]
+    fn estimate_from_output_parses_gib() {
+        let out = "send from @zrb-2026-05-01T00:00:00Z to tank/home@zrb-2026-05-22T14:30:00Z \
+                   estimated size is 1.23G\n";
+        assert_eq!(estimate_from_output(out), 1_320_702_443u64);
+    }
+
+    #[test]
+    fn estimate_from_output_falls_back_to_zero_on_missing_line() {
+        assert_eq!(estimate_from_output("no relevant output\n"), 0);
+    }
+
+    #[tokio::test]
+    async fn resume_on_resume_token_errors_gracefully() {
+        let hello = ServerHello {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            snapshots: vec![],
+            resume_token: Some("1-fake-resume-token".to_owned()),
+        };
+        let reader_bytes = version_ok_then_hello(&hello).await;
+
+        let result = super::resume_on(
+            "tank/home@zrb-2026-01-20T00:00:00Z",
+            &[],
+            &test_remote_cfg(),
+            "backup/home",
+            "my-laptop",
+            &mut tokio::io::BufReader::new(Cursor::new(reader_bytes)),
+            &mut tokio::io::sink(),
+            None,
+        )
+        .await;
+
+        // With a fake token, zfs::send_resume will either fail to spawn
+        // (ZFS unavailable) or produce an error stream (invalid token).
+        // Either way resume_on must return Err, never panic.
+        assert!(
+            result.is_err(),
+            "expected Err with fake resume token, got Ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_on_resume_token_errors_gracefully() {
+        let hello = ServerHello {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            snapshots: vec![],
+            resume_token: Some("1-fake-resume-token".to_owned()),
+        };
+        let reader_bytes = version_ok_then_hello(&hello).await;
+
+        let result = send_on(
+            "tank/home@zrb-2026-01-20T00:00:00Z",
+            &[],
+            &test_remote_cfg(),
+            "backup/home",
+            "my-laptop",
+            &mut tokio::io::BufReader::new(Cursor::new(reader_bytes)),
+            &mut tokio::io::sink(),
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "expected Err with fake resume token, got Ok"
         );
     }
 }

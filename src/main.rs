@@ -16,7 +16,7 @@ enum ShellChoice {
 }
 
 #[derive(Parser)]
-#[command(name = "zrb", about = "ZFS remote backup tool")]
+#[command(name = "zrb", about = "ZFS remote backup tool", version)]
 struct Cli {
     /// Enable debug logging.
     #[arg(short, long, global = true)]
