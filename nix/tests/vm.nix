@@ -2,7 +2,7 @@
 pkgs.testers.nixosTest {
   name = "module-vm-tests";
 
-  nodes.server = { ... }: {
+  nodes.server = { config, ... }: {
     imports = [ nixosModules.server ];
     services.openssh.enable = true;
     services.zrb.server.backup = {
@@ -13,6 +13,7 @@ pkgs.testers.nixosTest {
       };
       retention = { recent = 7; weeklyForDays = 30; monthlyForDays = 365; };
     };
+    environment.systemPackages = [ config.services.zrb.server.backup.package ];
   };
 
   nodes.client = { ... }: {
@@ -56,6 +57,7 @@ pkgs.testers.nixosTest {
     server.succeed("id zrb")
     server.succeed("test -f /etc/zrb/backup/server.toml")
     server.succeed("grep -q 'zrb server --client myhost' /etc/ssh/authorized_keys.d/zrb")
+    server.succeed("zrb --version")
 
     # Client: system user exists, config file present, send and prune timers enabled
     client.wait_for_unit("multi-user.target")

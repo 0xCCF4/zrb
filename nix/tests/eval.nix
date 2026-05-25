@@ -31,8 +31,10 @@ let
   };
 
   # Fake nodes used to test toUser derivation without a real multi-node eval.
+  # Each entry mirrors the shape of the evaluated NixOS config that the noxa
+  # framework provides as the `nodes` specialArg (flat, no `.configuration` wrapper).
   fakeNodes = {
-    backup-server.configuration.services.zrb.server.main = {
+    backup-server.services.zrb.server.main = {
       enable = true;
       user = "zrb-remote";
     };
@@ -40,7 +42,7 @@ let
 
   # Fake nodes used to test server-side client auto-population.
   fakeNodesServer = {
-    "my-laptop".configuration.services.zrb.client = {
+    "my-laptop".services.zrb.client = {
       enable = true;
       sourceName = "my-laptop";
       remotes."backup-server".noxa = {
@@ -51,6 +53,33 @@ let
       };
       datasets."tank/home"."backup-server" = "pool/home";
       datasets."tank/documents"."backup-server" = "pool/docs";
+    };
+  };
+
+  # Fake nodes used to test multi-client noxa auto-population.
+  fakeNodesMultiClient = {
+    "workstation".services.zrb.client = {
+      enable = true;
+      sourceName = "workstation";
+      remotes."backup-server".noxa = {
+        enable = true;
+        toNode = "backup-server";
+        serverInstance = "main";
+        toUser = "zrb";
+      };
+      datasets."tank/data"."backup-server" = "pool/workstation/data";
+    };
+    "laptop".services.zrb.client = {
+      enable = true;
+      sourceName = "laptop";
+      remotes."backup-server".noxa = {
+        enable = true;
+        toNode = "backup-server";
+        serverInstance = "main";
+        toUser = "zrb";
+      };
+      datasets."tank/home"."backup-server" = "pool/laptop/home";
+      datasets."tank/docs"."backup-server" = "pool/laptop/docs";
     };
   };
 
@@ -184,7 +213,20 @@ let
   # ── noxa fixtures ─────────────────────────────────────────────────────────
 
   # Server with noxa auto-population enabled; clients discovered from fakeNodesServer.
-  serverNoxaDiscoveryCfg = mkNixosWithArgs { nodes = fakeNodesServer; nodeName = "backup-server"; } [
+  serverNoxaDiscoveryCfg = mkNixosWithArgs { nodes = fakeNodesServer; noxaHost = "backup-server"; } [
+    nixosModules.noxa
+    stubNoxaModule
+    {
+      services.zrb.server.main = {
+        enable = true;
+        noxa.enable = true;
+        retention = { recent = 3; weeklyForDays = 7; monthlyForDays = 30; };
+      };
+    }
+  ];
+
+  # Server with multiple client nodes discovered via noxa.
+  serverNoxaMultiClientCfg = mkNixosWithArgs { nodes = fakeNodesMultiClient; noxaHost = "backup-server"; } [
     nixosModules.noxa
     stubNoxaModule
     {
@@ -378,6 +420,28 @@ let
     (lib.assertMsg
       (!(serverNoxaDiscoveryCfg.services.zrb.server ? "other"))
       "noxa server discovery: unexpected instance created")
+
+    # noxa multi-client: workstation auto-populated
+    (lib.assertMsg
+      (serverNoxaMultiClientCfg.services.zrb.server.main.clients ? "workstation")
+      "noxa multi-client: workstation not auto-populated")
+
+    # noxa multi-client: workstation allow list correct
+    (lib.assertMsg
+      (serverNoxaMultiClientCfg.services.zrb.server.main.clients."workstation".allow == [ "pool/workstation/data" ])
+      "noxa multi-client: workstation allow list incorrect")
+
+    # noxa multi-client: laptop auto-populated
+    (lib.assertMsg
+      (serverNoxaMultiClientCfg.services.zrb.server.main.clients ? "laptop")
+      "noxa multi-client: laptop not auto-populated")
+
+    # noxa multi-client: laptop allow list correct
+    (lib.assertMsg
+      (lib.sort lib.lessThan
+        serverNoxaMultiClientCfg.services.zrb.server.main.clients."laptop".allow
+      == [ "pool/laptop/docs" "pool/laptop/home" ])
+      "noxa multi-client: laptop allow list incorrect")
   ];
 in
 pkgs.runCommand "module-eval-tests" { } (builtins.deepSeq checks "touch $out\n")

@@ -1,8 +1,7 @@
-{ config, lib, ... }@args:
+{ config, lib, nodes ? { }, noxaHost ? "", ... }:
 with lib;
 let
   cfg = config.services.zrb.client;
-  nodes = args.nodes or { };
 in
 {
   imports = [ ./client.nix ./server.nix ];
@@ -33,9 +32,9 @@ in
       config = mkIf config.noxa.enable {
         noxa.toUser = mkIf
           (nodes ? ${config.noxa.toNode}
-            && nodes.${config.noxa.toNode}.configuration.services.zrb.server ? ${config.noxa.serverInstance}
-            && nodes.${config.noxa.toNode}.configuration.services.zrb.server.${config.noxa.serverInstance}.enable)
-          (mkDefault nodes.${config.noxa.toNode}.configuration.services.zrb.server.${config.noxa.serverInstance}.user);
+            && nodes.${config.noxa.toNode}.services.zrb.server ? ${config.noxa.serverInstance}
+            && nodes.${config.noxa.toNode}.services.zrb.server.${config.noxa.serverInstance}.enable)
+          (mkDefault nodes.${config.noxa.toNode}.services.zrb.server.${config.noxa.serverInstance}.user);
         host = mkDefault "zrb-${name}";
       };
     }));
@@ -57,14 +56,14 @@ in
         clients = listToAttrs (concatLists (mapAttrsToList
           (clientNodeName: clientNode:
             let
-              clientEnabled = clientNode.configuration.services.zrb.client.enable or false;
-              clientRemotes = clientNode.configuration.services.zrb.client.remotes or { };
-              clientDatasets = clientNode.configuration.services.zrb.client.datasets or { };
-              clientSourceName = clientNode.configuration.services.zrb.client.sourceName or "";
+              clientEnabled = clientNode.services.zrb.client.enable or false;
+              clientRemotes = if clientEnabled then clientNode.services.zrb.client.remotes or { } else { };
+              clientDatasets = if clientEnabled then clientNode.services.zrb.client.datasets or { } else { };
+              clientSourceName = if clientEnabled then clientNode.services.zrb.client.sourceName or "" else "";
               matchingRemotes = filterAttrs
                 (_: r:
                   (r ? noxa) && r.noxa.enable
-                  && r.noxa.toNode == nodeName
+                  && r.noxa.toNode == noxaHost
                   && r.noxa.serverInstance == name
                 )
                 clientRemotes;
