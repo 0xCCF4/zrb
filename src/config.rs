@@ -57,7 +57,11 @@ pub fn parse_bandwidth(s: &str) -> Result<u64, String> {
 
     let divisor = if is_bits { 8.0f64 } else { 1.0f64 };
     // scale is at most 1e9; value is non-negative; truncation to u64 is intentional
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     let bytes_per_sec = (value * (scale as f64) / divisor) as u64;
 
     Ok(bytes_per_sec)
@@ -216,7 +220,10 @@ monthly_for_days = 730
         assert_eq!(remote.user.as_deref(), Some("zfsbackup"));
         assert_eq!(remote.ssh_opts, ["-o", "ServerAliveInterval=30"]);
         let home = cfg.datasets.get("tank/home").expect("tank/home dataset");
-        assert_eq!(home.get("primary").map(String::as_str), Some("backup/laptop/home"));
+        assert_eq!(
+            home.get("primary").map(String::as_str),
+            Some("backup/laptop/home")
+        );
         assert_eq!(cfg.retention.recent, 7);
         assert_eq!(cfg.retention.weekly_for_days, 30);
         assert_eq!(cfg.retention.monthly_for_days, 365);
@@ -227,15 +234,18 @@ monthly_for_days = 730
         let cfg: ServerConfig = toml::from_str(SERVER_TOML).expect("should parse");
         assert_eq!(cfg.resume_hold_days(), 3);
         let client = cfg.clients.get("my-laptop").expect("my-laptop client");
-        assert_eq!(client.allow, ["backup/laptop/home", "backup/laptop/documents"]);
+        assert_eq!(
+            client.allow,
+            ["backup/laptop/home", "backup/laptop/documents"]
+        );
         assert!(client.zfs_receive_opts.is_empty());
         assert_eq!(cfg.retention.recent, 14);
     }
 
     #[test]
     fn load_source_errors_on_missing_file() {
-        let err = load_source(Path::new("/tmp/zrb-nonexistent-config.toml"))
-            .expect_err("should fail");
+        let err =
+            load_source(Path::new("/tmp/zrb-nonexistent-config.toml")).expect_err("should fail");
         assert!(matches!(err, ConfigError::Io(_)));
     }
 
@@ -267,7 +277,10 @@ monthly_for_days = 730
     fn remote_config_ssh_key_present_is_some() {
         let cfg: SourceConfig = toml::from_str(SOURCE_TOML).expect("should parse");
         let remote = cfg.remotes.get("primary").expect("primary remote");
-        assert_eq!(remote.ssh_key.as_deref(), Some("/home/user/.ssh/id_zfsbackup"));
+        assert_eq!(
+            remote.ssh_key.as_deref(),
+            Some("/home/user/.ssh/id_zfsbackup")
+        );
     }
 
     #[test]

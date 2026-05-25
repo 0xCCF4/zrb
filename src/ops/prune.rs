@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 
 use crate::ops::list as ops_list;
-use crate::retention::policy::{apply, RetentionConfig};
+use crate::retention::policy::{RetentionConfig, apply};
 use crate::zfs::client;
 
 /// Apply the Retention Policy to `dataset` and all child datasets.
@@ -29,9 +29,9 @@ pub struct PruneResult {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ResumeDecision {
-    Idle,    // no token; clear any stale since property
-    Wait,    // token present, hold period not yet elapsed; skip snapshot pruning
-    Expire,  // token present, hold period elapsed; abort
+    Idle,   // no token; clear any stale since property
+    Wait,   // token present, hold period not yet elapsed; skip snapshot pruning
+    Expire, // token present, hold period elapsed; abort
 }
 
 pub(crate) fn resume_decision(
@@ -111,7 +111,10 @@ pub fn prune(
         ResumeDecision::Wait => {
             // Resume in progress and hold period not elapsed; skip snapshot pruning
             // to avoid invalidating the resume token.
-            return Ok(PruneResult { kept: vec![], deleted: vec![] });
+            return Ok(PruneResult {
+                kept: vec![],
+                deleted: vec![],
+            });
         }
         ResumeDecision::Expire => {
             client::abort_resume(dataset)?;
@@ -140,7 +143,10 @@ mod tests {
 
     #[test]
     fn no_token_is_idle() {
-        assert_eq!(resume_decision(false, None, now(), Some(3)), ResumeDecision::Idle);
+        assert_eq!(
+            resume_decision(false, None, now(), Some(3)),
+            ResumeDecision::Idle
+        );
     }
 
     #[test]
@@ -155,12 +161,18 @@ mod tests {
     #[test]
     fn token_no_since_is_wait() {
         // Server has not yet annotated; prune waits rather than starting the timer.
-        assert_eq!(resume_decision(true, None, now(), Some(3)), ResumeDecision::Wait);
+        assert_eq!(
+            resume_decision(true, None, now(), Some(3)),
+            ResumeDecision::Wait
+        );
     }
 
     #[test]
     fn token_no_since_no_hold_days_is_wait() {
-        assert_eq!(resume_decision(true, None, now(), None), ResumeDecision::Wait);
+        assert_eq!(
+            resume_decision(true, None, now(), None),
+            ResumeDecision::Wait
+        );
     }
 
     #[test]

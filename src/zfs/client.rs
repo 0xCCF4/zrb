@@ -1,7 +1,11 @@
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Command, Stdio};
 
 use chrono::{DateTime, Utc};
 use thiserror::Error;
+use tokio::process::{
+    Child as TokioChild, ChildStdin as TokioChildStdin, ChildStdout as TokioChildStdout,
+    Command as TokioCommand,
+};
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -16,9 +20,7 @@ fn is_dataset_not_found(err: &ClientError) -> bool {
 }
 
 fn run(mut cmd: Command) -> Result<String, ClientError> {
-    let output = cmd
-        .output()
-        .map_err(ClientError::Spawn)?;
+    let output = cmd.output().map_err(ClientError::Spawn)?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
@@ -34,7 +36,8 @@ fn run(mut cmd: Command) -> Result<String, ClientError> {
 /// Returns [`ClientError`] if the `zfs` process cannot be spawned or exits non-zero.
 pub fn create_snapshot(dataset: &str, snapshot_name: &str) -> Result<(), ClientError> {
     let mut cmd = Command::new("zfs");
-    cmd.arg("snapshot").arg(format!("{dataset}@{snapshot_name}"));
+    cmd.arg("snapshot")
+        .arg(format!("{dataset}@{snapshot_name}"));
     run(cmd).map(|_| ())
 }
 
@@ -71,7 +74,9 @@ fn parse_list_output(output: &str) -> Vec<String> {
 /// accidentally destroying a dataset instead of a zrb-managed snapshot.
 pub fn destroy_snapshot(snapshot: &str) -> Result<(), ClientError> {
     assert!(
-        snapshot.split_once('@').is_some_and(|(_, name)| name.starts_with("zrb-")),
+        snapshot
+            .split_once('@')
+            .is_some_and(|(_, name)| name.starts_with("zrb-")),
         "Guardrail tripped: not a zrb snapshot: {snapshot}"
     );
     let mut cmd = Command::new("zfs");
@@ -79,7 +84,7 @@ pub fn destroy_snapshot(snapshot: &str) -> Result<(), ClientError> {
     run(cmd).map(|_| ())
 }
 
-/// Spawn `zfs send [-i <base>] <snapshot>` and return the stdout pipe.
+/// Spawn `zfs send [-i <base>] <snapshot>` and return the async stdout pipe.
 ///
 /// # Errors
 /// Returns [`ClientError`] if the process cannot be spawned.
@@ -90,8 +95,8 @@ pub fn send_incremental(
     base: Option<&str>,
     snapshot: &str,
     opts: &[String],
-) -> Result<ChildStdout, ClientError> {
-    let mut cmd = Command::new("zfs");
+) -> Result<TokioChildStdout, ClientError> {
+    let mut cmd = TokioCommand::new("zfs");
     cmd.arg("send");
     if let Some(b) = base {
         cmd.args(["-i", b]);
@@ -103,15 +108,15 @@ pub fn send_incremental(
     Ok(child.stdout.expect("stdout piped"))
 }
 
-/// Spawn `zfs send -t <token>` and return the stdout pipe.
+/// Spawn `zfs send -t <token>` and return the async stdout pipe.
 ///
 /// # Errors
 /// Returns [`ClientError`] if the process cannot be spawned.
 ///
 /// # Panics
 /// Never panics — stdout is always present because `Stdio::piped()` is set unconditionally.
-pub fn send_resume(token: &str, opts: &[String]) -> Result<ChildStdout, ClientError> {
-    let mut cmd = Command::new("zfs");
+pub fn send_resume(token: &str, opts: &[String]) -> Result<TokioChildStdout, ClientError> {
+    let mut cmd = TokioCommand::new("zfs");
     cmd.args(["send", "-t", token]);
     cmd.args(opts);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -121,8 +126,8 @@ pub fn send_resume(token: &str, opts: &[String]) -> Result<ChildStdout, ClientEr
 
 /// Handle for an in-progress `zfs receive` process.
 pub struct ZfsReceive {
-    pub stdin: ChildStdin,
-    child: Child,
+    pub stdin: TokioChildStdin,
+    child: TokioChild,
 }
 
 impl ZfsReceive {
@@ -131,10 +136,10 @@ impl ZfsReceive {
     ///
     /// # Errors
     /// Returns [`ClientError`] if `wait` fails or if `zfs receive` exits non-zero.
-    pub fn finish(self) -> Result<(), ClientError> {
+    pub async fn finish(self) -> Result<(), ClientError> {
         let Self { stdin, child } = self;
         drop(stdin);
-        let output = child.wait_with_output().map_err(ClientError::Spawn)?;
+        let output = child.wait_with_output().await.map_err(ClientError::Spawn)?;
         if output.status.success() {
             Ok(())
         } else {
@@ -156,7 +161,7 @@ impl ZfsReceive {
 /// # Panics
 /// Never panics — stdin is always present because `Stdio::piped()` is set unconditionally.
 pub fn receive(dataset: &str, opts: &[String]) -> Result<ZfsReceive, ClientError> {
-    let mut cmd = Command::new("zfs");
+    let mut cmd = TokioCommand::new("zfs");
     cmd.args(["receive", "-s", dataset]);
     cmd.args(opts);
     cmd.stdin(Stdio::piped()).stderr(Stdio::piped());
@@ -231,7 +236,9 @@ fn parse_resume_since(value: &str) -> Option<DateTime<Utc>> {
     if value == "-" {
         None
     } else {
-        DateTime::parse_from_rfc3339(value).ok().map(|dt| dt.to_utc())
+        DateTime::parse_from_rfc3339(value)
+            .ok()
+            .map(|dt| dt.to_utc())
     }
 }
 
@@ -331,7 +338,13 @@ mod tests {
     fn list_output_parses_names() {
         let out = "tank/home@zrb-2026-01-01T00:00:00Z\ntank/home@zrb-2026-01-02T00:00:00Z\n";
         let got = parse_list_output(out);
-        assert_eq!(got, ["tank/home@zrb-2026-01-01T00:00:00Z", "tank/home@zrb-2026-01-02T00:00:00Z"]);
+        assert_eq!(
+            got,
+            [
+                "tank/home@zrb-2026-01-01T00:00:00Z",
+                "tank/home@zrb-2026-01-02T00:00:00Z"
+            ]
+        );
     }
 
     #[test]

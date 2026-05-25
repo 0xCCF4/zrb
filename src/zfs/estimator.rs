@@ -30,9 +30,7 @@ pub fn parse_estimated_size(output: &str) -> Result<u64, EstimatorError> {
 
 fn parse_size_str(s: &str) -> Option<u64> {
     // Split into numeric part and unit suffix.
-    let split_pos = s
-        .find(|c: char| c.is_alphabetic())
-        .unwrap_or(s.len());
+    let split_pos = s.find(|c: char| c.is_alphabetic()).unwrap_or(s.len());
     let (num_str, unit) = s.split_at(split_pos);
     let num: f64 = num_str.trim().parse().ok()?;
     let multiplier: u64 = match unit.trim() {
@@ -65,10 +63,7 @@ mod tests {
     #[test]
     fn parses_gigabytes() {
         // 1.23 * 1_073_741_824 ≈ 1_320_702_443
-        assert_eq!(
-            parse_estimated_size(&output("1.23G")),
-            Ok(1_320_702_443u64)
-        );
+        assert_eq!(parse_estimated_size(&output("1.23G")), Ok(1_320_702_443u64));
     }
 
     #[test]

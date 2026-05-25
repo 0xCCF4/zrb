@@ -1,8 +1,8 @@
-use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use chrono::Utc;
+use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
 
 use crate::config::ServerConfig;
 use crate::protocol::codec::{self, ServerHello, ServerStatus};
@@ -37,17 +37,21 @@ pub fn server(config: &ServerConfig, permitted_clients: &[String]) -> anyhow::Re
     // SAFETY: signal handlers that only set an AtomicBool are async-signal-safe.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-        libc::signal(libc::SIGHUP, handle_sighup as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGHUP,
+            handle_sighup as *const () as libc::sighandler_t,
+        );
     }
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut input = BufReader::new(stdin.lock());
-    let mut output = stdout.lock();
     let permitted: Vec<&str> = permitted_clients.iter().map(String::as_str).collect();
-    run_server_on(config, &permitted, &mut input, &mut output, &CANCEL)
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let mut input = tokio::io::BufReader::new(tokio::io::stdin());
+        let mut output = tokio::io::stdout();
+        run_server_on(config, &permitted, &mut input, &mut output, &CANCEL).await
+    })
 }
 
-/// Run the server protocol over arbitrary `Read`/`Write` streams.
+/// Run the server protocol over arbitrary async `Read`/`Write` streams.
 ///
 /// `cancel` is checked between chunks; when set, the streaming loop stops
 /// cleanly after the current chunk.
@@ -55,14 +59,16 @@ pub fn server(config: &ServerConfig, permitted_clients: &[String]) -> anyhow::Re
 /// # Errors
 /// Returns `Err` on I/O or codec failure. Validation rejections are sent as
 /// `ServerStatus { ok: false }` and return `Ok(())`.
-pub fn run_server_on<R: BufRead, W: Write>(
+pub async fn run_server_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     config: &ServerConfig,
     permitted_clients: &[&str],
     input: &mut R,
     output: &mut W,
     cancel: &AtomicBool,
 ) -> anyhow::Result<()> {
-    let request = codec::decode_client_hello(input).context("reading ClientHello")?;
+    let request = codec::decode_client_hello(input)
+        .await
+        .context("reading ClientHello")?;
 
     if !version_compatible(&request.version, env!("CARGO_PKG_VERSION")) {
         codec::encode_server_status(
@@ -75,10 +81,18 @@ pub fn run_server_on<R: BufRead, W: Write>(
                 ),
             },
             output,
-        )?;
+        )
+        .await?;
         return Ok(());
     }
-    codec::encode_server_status(&ServerStatus { ok: true, message: "ok".to_owned() }, output)?;
+    codec::encode_server_status(
+        &ServerStatus {
+            ok: true,
+            message: "ok".to_owned(),
+        },
+        output,
+    )
+    .await?;
 
     if !permitted_clients.contains(&request.client_name.as_str()) {
         codec::encode_server_status(
@@ -87,7 +101,8 @@ pub fn run_server_on<R: BufRead, W: Write>(
                 message: format!("unknown client: {}", request.client_name),
             },
             output,
-        )?;
+        )
+        .await?;
         return Ok(());
     }
 
@@ -102,60 +117,74 @@ pub fn run_server_on<R: BufRead, W: Write>(
                 message: format!("dataset not allowed: {}", request.target),
             },
             output,
-        )?;
+        )
+        .await?;
         return Ok(());
     }
 
-    let resume_token = zfs::get_resume_token(&request.target)
-        .context("checking resume token")?;
+    let resume_token = zfs::get_resume_token(&request.target).context("checking resume token")?;
 
-    let raw_snaps = zfs::list_snapshots(&request.target)
-        .context("listing snapshots")?;
+    let raw_snaps = zfs::list_snapshots(&request.target).context("listing snapshots")?;
     let snapshots = naming::filter_zrb(&raw_snaps);
 
     codec::encode_server_hello(
-        &ServerHello { version: env!("CARGO_PKG_VERSION").to_owned(), snapshots, resume_token },
+        &ServerHello {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            snapshots,
+            resume_token,
+        },
         output,
-    )?;
-    output.flush()?;
+    )
+    .await?;
+    output.flush().await?;
 
-    let mut recv =
-        zfs::receive(&request.target, &client_cfg.zfs_receive_opts).context("spawning zfs receive")?;
+    let mut recv = zfs::receive(&request.target, &client_cfg.zfs_receive_opts)
+        .context("spawning zfs receive")?;
 
-    let stream_result = codec::read_stream_with_cancel(input, &mut recv.stdin, cancel);
+    let stream_result = codec::read_stream_with_cancel(input, &mut recv.stdin, cancel).await;
 
     match stream_result {
         Ok(true) => {
             // SIGHUP: SSH session closed mid-transfer.
-            let _ = recv.finish();
+            let _ = recv.finish().await;
             annotate_resume_if_needed(&request.target)?;
             log::info!("client disconnected mid-transfer; cleaned up");
             return Ok(());
         }
-        Ok(false) => {
-            match recv.finish() {
-                Ok(()) => {
-                    codec::encode_server_status(
-                        &ServerStatus { ok: true, message: "ok".to_owned() },
-                        output,
-                    )?;
-                }
-                Err(e) => {
-                    annotate_resume_if_needed(&request.target)?;
-                    codec::encode_server_status(
-                        &ServerStatus { ok: false, message: e.to_string() },
-                        output,
-                    )?;
-                }
+        Ok(false) => match recv.finish().await {
+            Ok(()) => {
+                codec::encode_server_status(
+                    &ServerStatus {
+                        ok: true,
+                        message: "ok".to_owned(),
+                    },
+                    output,
+                )
+                .await?;
             }
-        }
+            Err(e) => {
+                annotate_resume_if_needed(&request.target)?;
+                codec::encode_server_status(
+                    &ServerStatus {
+                        ok: false,
+                        message: e.to_string(),
+                    },
+                    output,
+                )
+                .await?;
+            }
+        },
         Err(e) => {
-            let _ = recv.finish();
+            let _ = recv.finish().await;
             annotate_resume_if_needed(&request.target)?;
             codec::encode_server_status(
-                &ServerStatus { ok: false, message: e.to_string() },
+                &ServerStatus {
+                    ok: false,
+                    message: e.to_string(),
+                },
                 output,
-            )?;
+            )
+            .await?;
         }
     }
     Ok(())
@@ -169,8 +198,7 @@ fn annotate_resume_if_needed(dataset: &str) -> anyhow::Result<()> {
             .context("checking resume-since for annotation")?
             .is_none()
     {
-        zfs::set_resume_since(dataset, Utc::now())
-            .context("setting resume-since")?;
+        zfs::set_resume_since(dataset, Utc::now()).context("setting resume-since")?;
     }
     Ok(())
 }
@@ -206,66 +234,88 @@ monthly_for_days = 730
         .expect("test config")
     }
 
-    fn make_client_hello(client_name: &str, target: &str) -> Vec<u8> {
-        make_client_hello_with_version(env!("CARGO_PKG_VERSION"), client_name, target)
+    async fn make_client_hello(client_name: &str, target: &str) -> Vec<u8> {
+        make_client_hello_with_version(env!("CARGO_PKG_VERSION"), client_name, target).await
     }
 
-    fn make_client_hello_with_version(version: &str, client_name: &str, target: &str) -> Vec<u8> {
+    async fn make_client_hello_with_version(
+        version: &str,
+        client_name: &str,
+        target: &str,
+    ) -> Vec<u8> {
         let msg = ClientHello {
             version: version.to_owned(),
             client_name: client_name.to_owned(),
             target: target.to_owned(),
         };
         let mut buf = Vec::new();
-        codec::encode_client_hello(&msg, &mut buf).unwrap();
+        codec::encode_client_hello(&msg, &mut buf).await.unwrap();
         buf
     }
 
-    #[test]
-    fn version_major_mismatch_gets_rejection() {
+    #[tokio::test]
+    async fn version_major_mismatch_gets_rejection() {
         let cfg = test_config();
         let permitted = ["my-laptop"];
-        let input_bytes = make_client_hello_with_version("1.0.0", "my-laptop", "backup/laptop/home");
+        let input_bytes =
+            make_client_hello_with_version("1.0.0", "my-laptop", "backup/laptop/home").await;
         let mut output = Vec::new();
         run_server_on(
             &cfg,
             &permitted,
-            &mut Cursor::new(input_bytes),
+            &mut tokio::io::BufReader::new(Cursor::new(input_bytes)),
             &mut output,
             &no_cancel(),
         )
+        .await
         .unwrap();
-        let status = codec::decode_server_status(&mut Cursor::new(&output)).unwrap();
+        let status =
+            codec::decode_server_status(&mut tokio::io::BufReader::new(Cursor::new(&output)))
+                .await
+                .unwrap();
         assert!(!status.ok);
-        assert!(status.message.contains("version mismatch"), "unexpected: {}", status.message);
+        assert!(
+            status.message.contains("version mismatch"),
+            "unexpected: {}",
+            status.message
+        );
     }
 
-    #[test]
-    fn version_minor_mismatch_gets_rejection() {
+    #[tokio::test]
+    async fn version_minor_mismatch_gets_rejection() {
         let cfg = test_config();
         let permitted = ["my-laptop"];
-        let input_bytes = make_client_hello_with_version("0.99.0", "my-laptop", "backup/laptop/home");
+        let input_bytes =
+            make_client_hello_with_version("0.99.0", "my-laptop", "backup/laptop/home").await;
         let mut output = Vec::new();
         run_server_on(
             &cfg,
             &permitted,
-            &mut Cursor::new(input_bytes),
+            &mut tokio::io::BufReader::new(Cursor::new(input_bytes)),
             &mut output,
             &no_cancel(),
         )
+        .await
         .unwrap();
-        let status = codec::decode_server_status(&mut Cursor::new(&output)).unwrap();
+        let status =
+            codec::decode_server_status(&mut tokio::io::BufReader::new(Cursor::new(&output)))
+                .await
+                .unwrap();
         assert!(!status.ok);
-        assert!(status.message.contains("version mismatch"), "unexpected: {}", status.message);
+        assert!(
+            status.message.contains("version mismatch"),
+            "unexpected: {}",
+            status.message
+        );
     }
 
-    #[test]
-    fn version_patch_difference_is_accepted() {
+    #[tokio::test]
+    async fn version_patch_difference_is_accepted() {
         let cfg = test_config();
         let permitted = ["my-laptop"];
         // Current version is 0.1.0; send 0.1.99 — patch diff only, must be accepted.
         let input_bytes =
-            make_client_hello_with_version("0.1.99", "my-laptop", "backup/laptop/home");
+            make_client_hello_with_version("0.1.99", "my-laptop", "backup/laptop/home").await;
         let mut output = Vec::new();
         // Ignore the result: run_server_on may fail on the ZFS call that follows the
         // version gate (zfs binary absent in sandbox). We only care about the first
@@ -273,57 +323,67 @@ monthly_for_days = 730
         let _ = run_server_on(
             &cfg,
             &permitted,
-            &mut Cursor::new(input_bytes),
+            &mut tokio::io::BufReader::new(Cursor::new(input_bytes)),
             &mut output,
             &no_cancel(),
-        );
+        )
+        .await;
         // First ServerStatus is the version gate — must be ok.
-        let status = codec::decode_server_status(&mut Cursor::new(&output)).unwrap();
-        assert!(status.ok, "patch-only version diff should be accepted: {}", status.message);
+        let status =
+            codec::decode_server_status(&mut tokio::io::BufReader::new(Cursor::new(&output)))
+                .await
+                .unwrap();
+        assert!(
+            status.ok,
+            "patch-only version diff should be accepted: {}",
+            status.message
+        );
     }
 
-    fn read_two_statuses(output: &[u8]) -> (ServerStatus, ServerStatus) {
-        let mut cur = std::io::Cursor::new(output);
-        let first = codec::decode_server_status(&mut cur).unwrap();
-        let second = codec::decode_server_status(&mut cur).unwrap();
+    async fn read_two_statuses(output: &[u8]) -> (ServerStatus, ServerStatus) {
+        let mut cur = tokio::io::BufReader::new(Cursor::new(output));
+        let first = codec::decode_server_status(&mut cur).await.unwrap();
+        let second = codec::decode_server_status(&mut cur).await.unwrap();
         (first, second)
     }
 
-    #[test]
-    fn unknown_client_gets_rejection() {
+    #[tokio::test]
+    async fn unknown_client_gets_rejection() {
         let cfg = test_config();
         let permitted = ["my-laptop"];
-        let input_bytes = make_client_hello("rogue-host", "backup/laptop/home");
+        let input_bytes = make_client_hello("rogue-host", "backup/laptop/home").await;
         let mut output = Vec::new();
         run_server_on(
             &cfg,
             &permitted,
-            &mut Cursor::new(input_bytes),
+            &mut tokio::io::BufReader::new(Cursor::new(input_bytes)),
             &mut output,
             &no_cancel(),
         )
+        .await
         .unwrap();
-        let (version_status, rejection) = read_two_statuses(&output);
+        let (version_status, rejection) = read_two_statuses(&output).await;
         assert!(version_status.ok, "version gate should pass");
         assert!(!rejection.ok);
         assert!(rejection.message.contains("unknown client"));
     }
 
-    #[test]
-    fn dataset_not_in_allow_list_gets_rejection() {
+    #[tokio::test]
+    async fn dataset_not_in_allow_list_gets_rejection() {
         let cfg = test_config();
         let permitted = ["my-laptop"];
-        let input_bytes = make_client_hello("my-laptop", "backup/laptop/secret");
+        let input_bytes = make_client_hello("my-laptop", "backup/laptop/secret").await;
         let mut output = Vec::new();
         run_server_on(
             &cfg,
             &permitted,
-            &mut Cursor::new(input_bytes),
+            &mut tokio::io::BufReader::new(Cursor::new(input_bytes)),
             &mut output,
             &no_cancel(),
         )
+        .await
         .unwrap();
-        let (version_status, rejection) = read_two_statuses(&output);
+        let (version_status, rejection) = read_two_statuses(&output).await;
         assert!(version_status.ok, "version gate should pass");
         assert!(!rejection.ok);
         assert!(rejection.message.contains("not allowed"));
