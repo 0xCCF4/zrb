@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::retention::policy::RetentionConfig;
@@ -12,6 +12,68 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error("cannot parse config: {0}")]
     Toml(#[from] toml::de::Error),
+}
+
+/// Parse a human-readable bandwidth string into bytes/sec.
+///
+/// Accepts an optional SI prefix (k/K/m/M/g/G = ×1000/1e6/1e9) and an optional
+/// unit suffix. If the suffix ends in `bit` or `bits`, the value is divided by 8
+/// to convert from bits/sec to bytes/sec. A bare integer is treated as bytes/sec.
+///
+/// Examples: `"10M"` → `10_000_000`, `"100Mbit"` → `12_500_000`, `"1.5G"` → `1_500_000_000`.
+///
+/// # Errors
+/// Returns a `String` error message if the input cannot be parsed.
+pub fn parse_bandwidth(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+
+    // Strip trailing "bits" or "bit" and record whether we saw them
+    let lower = s.to_ascii_lowercase();
+    let (s, is_bits) = if lower.ends_with("bits") {
+        (&s[..s.len() - 4], true)
+    } else if lower.ends_with("bit") {
+        (&s[..s.len() - 3], true)
+    } else if s.ends_with('B') | s.ends_with('b') {
+        (&s[..s.len() - 1], false)
+    } else {
+        (s, false)
+    };
+
+    // Split numeric part from SI prefix
+    let (number_str, scale) = match s.chars().last() {
+        Some('k' | 'K') => (&s[..s.len() - 1], 1_000u64),
+        Some('m' | 'M') => (&s[..s.len() - 1], 1_000_000u64),
+        Some('g' | 'G') => (&s[..s.len() - 1], 1_000_000_000u64),
+        _ => (s, 1u64),
+    };
+
+    let value: f64 = number_str
+        .parse()
+        .map_err(|_| format!("invalid bandwidth value: {number_str:?}"))?;
+
+    if value < 0.0 {
+        return Err(format!("bandwidth limit must be non-negative, got {value}"));
+    }
+
+    let divisor = if is_bits { 8.0f64 } else { 1.0f64 };
+    // scale is at most 1e9; value is non-negative; truncation to u64 is intentional
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let bytes_per_sec = (value * (scale as f64) / divisor) as u64;
+
+    Ok(bytes_per_sec)
+}
+
+fn deserialize_bandwidth_limit<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: Option<String> = Option::deserialize(deserializer)?;
+    match s {
+        None => Ok(None),
+        Some(v) => parse_bandwidth(&v)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -27,7 +89,7 @@ pub struct RemoteConfig {
     pub ssh_opts: Vec<String>,
     #[serde(default)]
     pub zfs_send_opts: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bandwidth_limit")]
     pub bandwidth_limit: Option<u64>,
 }
 
@@ -224,14 +286,61 @@ monthly_for_days = 730
     }
 
     #[test]
-    fn remote_config_bandwidth_limit_parses() {
+    fn remote_config_bandwidth_limit_parses_megabytes() {
         let with_limit = SOURCE_TOML.replace(
             "zfs_send_opts = []",
-            "zfs_send_opts = []\nbandwidth_limit = 10485760",
+            "zfs_send_opts = []\nbandwidth_limit = \"10M\"",
         );
         let cfg: SourceConfig = toml::from_str(&with_limit).expect("should parse");
         let remote = cfg.remotes.get("primary").expect("primary remote");
-        assert_eq!(remote.bandwidth_limit, Some(10_485_760));
+        assert_eq!(remote.bandwidth_limit, Some(10_000_000));
+    }
+
+    #[test]
+    fn remote_config_bandwidth_limit_parses_mbit() {
+        let with_limit = SOURCE_TOML.replace(
+            "zfs_send_opts = []",
+            "zfs_send_opts = []\nbandwidth_limit = \"100Mbit\"",
+        );
+        let cfg: SourceConfig = toml::from_str(&with_limit).expect("should parse");
+        let remote = cfg.remotes.get("primary").expect("primary remote");
+        assert_eq!(remote.bandwidth_limit, Some(12_500_000));
+    }
+
+    #[test]
+    fn remote_config_bandwidth_limit_parses_decimal() {
+        let with_limit = SOURCE_TOML.replace(
+            "zfs_send_opts = []",
+            "zfs_send_opts = []\nbandwidth_limit = \"1.5M\"",
+        );
+        let cfg: SourceConfig = toml::from_str(&with_limit).expect("should parse");
+        let remote = cfg.remotes.get("primary").expect("primary remote");
+        assert_eq!(remote.bandwidth_limit, Some(1_500_000));
+    }
+
+    #[test]
+    fn remote_config_bandwidth_limit_parses_bare_integer() {
+        let with_limit = SOURCE_TOML.replace(
+            "zfs_send_opts = []",
+            "zfs_send_opts = []\nbandwidth_limit = \"1048576\"",
+        );
+        let cfg: SourceConfig = toml::from_str(&with_limit).expect("should parse");
+        let remote = cfg.remotes.get("primary").expect("primary remote");
+        assert_eq!(remote.bandwidth_limit, Some(1_048_576));
+    }
+
+    #[test]
+    fn parse_bandwidth_units() {
+        assert_eq!(parse_bandwidth("1k").unwrap(), 1_000);
+        assert_eq!(parse_bandwidth("1K").unwrap(), 1_000);
+        assert_eq!(parse_bandwidth("1M").unwrap(), 1_000_000);
+        assert_eq!(parse_bandwidth("1G").unwrap(), 1_000_000_000);
+        assert_eq!(parse_bandwidth("100Mbit").unwrap(), 12_500_000);
+        assert_eq!(parse_bandwidth("100Mbits").unwrap(), 12_500_000);
+        assert_eq!(parse_bandwidth("1kbit").unwrap(), 125);
+        assert_eq!(parse_bandwidth("1Gbit").unwrap(), 125_000_000);
+        assert_eq!(parse_bandwidth("10MB").unwrap(), 10_000_000);
+        assert_eq!(parse_bandwidth("500").unwrap(), 500);
     }
 
     #[test]

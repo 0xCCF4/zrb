@@ -39,10 +39,14 @@ enum Commands {
         datasets: Vec<String>,
     },
 
-    /// List zrb-managed snapshots for a dataset.
+    /// List zrb-managed snapshots. Omit DATASET to list all datasets.
     List {
-        /// Dataset to inspect.
-        dataset: String,
+        /// Dataset to inspect (omit to list all).
+        dataset: Option<String>,
+
+        /// Also list child datasets. Without DATASET, lists all datasets.
+        #[arg(long, short = 'r')]
+        recursive: bool,
     },
 
     /// Send snapshots to one or more configured Remotes.
@@ -68,8 +72,12 @@ enum Commands {
         dataset: Option<String>,
 
         /// Prune all datasets that have zrb-managed snapshots.
-        #[arg(long, conflicts_with = "dataset")]
+        #[arg(long, conflicts_with = "dataset", conflicts_with = "recursive")]
         all: bool,
+
+        /// Also prune child datasets. Requires DATASET.
+        #[arg(long, short = 'r', conflicts_with = "all", requires = "dataset")]
+        recursive: bool,
     },
 
     /// Run in server mode (invoked via SSH `ForceCommand`).
@@ -88,6 +96,13 @@ enum Commands {
     Man,
 }
 
+fn validate_dataset(ds: &str) -> anyhow::Result<()> {
+    if ds.starts_with('/') {
+        anyhow::bail!("invalid dataset \"{ds}\": ZFS dataset paths must not start with \"/\"");
+    }
+    Ok(())
+}
+
 fn xdg_config_home() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -103,6 +118,19 @@ fn default_server_config() -> PathBuf {
     xdg_config_home().join("zrb/server.toml")
 }
 
+fn print_grouped(groups: &[(String, Vec<String>)]) {
+    for (i, (dataset, snaps)) in groups.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        println!("{dataset}");
+        for s in snaps {
+            println!("  {s}");
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -111,6 +139,9 @@ fn run() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Snapshot { datasets } => {
+            for ds in &datasets {
+                validate_dataset(ds)?;
+            }
             let cfg_path = cli.config.unwrap_or_else(default_source_config);
             let cfg = config::load_source(&cfg_path)?;
             for ds in &datasets {
@@ -119,14 +150,22 @@ fn run() -> anyhow::Result<()> {
             }
         }
 
-        Commands::List { dataset } => {
-            let snaps = ops::list::list(&dataset)?;
-            for s in snaps {
-                println!("{s}");
+        Commands::List { dataset, recursive } => {
+            if let Some(ds) = &dataset {
+                validate_dataset(ds)?;
             }
+            let groups: Vec<(String, Vec<String>)> = match dataset.as_deref() {
+                None => ops::list::list_all()?,
+                Some(ds) if recursive => ops::list::list_recursive(ds)?,
+                Some(ds) => vec![(ds.to_owned(), ops::list::list(ds)?)],
+            };
+            print_grouped(&groups);
         }
 
         Commands::Send { datasets, remotes, resume } => {
+            for ds in &datasets {
+                validate_dataset(ds)?;
+            }
             let cfg_path = cli.config.unwrap_or_else(default_source_config);
             let cfg = config::load_source(&cfg_path)?;
             let _ = sd_notify::notify(&[NotifyState::Ready]);
@@ -144,7 +183,10 @@ fn run() -> anyhow::Result<()> {
             let _ = sd_notify::notify(&[NotifyState::Stopping]);
         }
 
-        Commands::Prune { dataset, all } => {
+        Commands::Prune { dataset, all, recursive } => {
+            if let Some(ds) = &dataset {
+                validate_dataset(ds)?;
+            }
             let cfg_path = cli.config.unwrap_or_else(default_source_config);
             // Server config takes priority: the remote runs `zrb prune` with
             // `--config server.toml`, which has `resume_hold_days`.
@@ -169,15 +211,22 @@ fn run() -> anyhow::Result<()> {
                 }
             } else {
                 let dataset = dataset.expect("required_unless_present = all");
-                let result = ops::prune::prune(&dataset, &retention, hold_days)?;
-                log::info!(
-                    "pruned {}: kept {}, deleted {}",
-                    dataset,
-                    result.kept.len(),
-                    result.deleted.len()
-                );
-                for s in &result.deleted {
-                    log::debug!("deleted {s}");
+                let results = if recursive {
+                    ops::prune::prune_recursive(&dataset, &retention, hold_days)?
+                } else {
+                    let result = ops::prune::prune(&dataset, &retention, hold_days)?;
+                    vec![(dataset, result)]
+                };
+                for (ds, result) in &results {
+                    log::info!(
+                        "pruned {}: kept {}, deleted {}",
+                        ds,
+                        result.kept.len(),
+                        result.deleted.len()
+                    );
+                    for s in &result.deleted {
+                        log::debug!("deleted {s}");
+                    }
                 }
             }
         }
@@ -304,6 +353,94 @@ mod tests {
     fn prune_dataset_and_all_conflict() {
         let cli = Cli::try_parse_from(["zrb", "prune", "tank/home", "--all"]);
         assert!(cli.is_err(), "zrb prune <dataset> --all should be a CLI error");
+    }
+
+    #[test]
+    fn list_no_args_parses() {
+        let cli = Cli::try_parse_from(["zrb", "list"]);
+        assert!(cli.is_ok(), "zrb list with no args should parse");
+        if let Ok(Cli { command: Commands::List { dataset, recursive }, .. }) = cli {
+            assert!(dataset.is_none());
+            assert!(!recursive);
+        }
+    }
+
+    #[test]
+    fn list_with_dataset_parses() {
+        let cli = Cli::try_parse_from(["zrb", "list", "tank/home"]).unwrap();
+        if let Commands::List { dataset, recursive } = cli.command {
+            assert_eq!(dataset.as_deref(), Some("tank/home"));
+            assert!(!recursive);
+        }
+    }
+
+    #[test]
+    fn list_recursive_with_dataset_parses() {
+        let cli = Cli::try_parse_from(["zrb", "list", "tank", "--recursive"]).unwrap();
+        if let Commands::List { dataset, recursive } = cli.command {
+            assert_eq!(dataset.as_deref(), Some("tank"));
+            assert!(recursive);
+        }
+    }
+
+    #[test]
+    fn list_recursive_short_flag_parses() {
+        let cli = Cli::try_parse_from(["zrb", "list", "tank", "-r"]).unwrap();
+        if let Commands::List { recursive, .. } = cli.command {
+            assert!(recursive);
+        }
+    }
+
+    #[test]
+    fn list_recursive_without_dataset_parses() {
+        let cli = Cli::try_parse_from(["zrb", "list", "--recursive"]);
+        assert!(cli.is_ok(), "zrb list --recursive with no dataset should parse");
+    }
+
+    #[test]
+    fn prune_recursive_with_dataset_parses() {
+        let cli = Cli::try_parse_from(["zrb", "prune", "tank", "--recursive"]).unwrap();
+        if let Commands::Prune { dataset, recursive, all } = cli.command {
+            assert_eq!(dataset.as_deref(), Some("tank"));
+            assert!(recursive);
+            assert!(!all);
+        }
+    }
+
+    #[test]
+    fn prune_recursive_short_flag_parses() {
+        let cli = Cli::try_parse_from(["zrb", "prune", "tank", "-r"]).unwrap();
+        if let Commands::Prune { recursive, .. } = cli.command {
+            assert!(recursive);
+        }
+    }
+
+    #[test]
+    fn prune_recursive_without_dataset_errors() {
+        let cli = Cli::try_parse_from(["zrb", "prune", "--recursive"]);
+        assert!(cli.is_err(), "zrb prune --recursive without a dataset should be a CLI error");
+    }
+
+    #[test]
+    fn prune_recursive_and_all_conflict() {
+        let cli = Cli::try_parse_from(["zrb", "prune", "--all", "--recursive"]);
+        assert!(cli.is_err(), "zrb prune --all --recursive should be a CLI error");
+    }
+
+    #[test]
+    fn validate_dataset_rejects_absolute_path() {
+        let err = validate_dataset("/something").unwrap_err();
+        assert!(err.to_string().contains("/something"));
+    }
+
+    #[test]
+    fn validate_dataset_accepts_pool_slash_dataset() {
+        assert!(validate_dataset("tank/home").is_ok());
+    }
+
+    #[test]
+    fn validate_dataset_accepts_bare_pool() {
+        assert!(validate_dataset("tank").is_ok());
     }
 
     #[test]

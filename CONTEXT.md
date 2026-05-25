@@ -24,9 +24,10 @@ The snapshot chosen as the base for `zfs send -i`. Selected by estimating the tr
 ## Prune
 The operation of deleting snapshots that fall outside the Retention Policy. Runs locally on whichever host invokes it — Source and Remote prune independently. No cross-host communication. Subcommand: `zrb prune`.
 
-Two invocation forms:
+Three invocation forms:
 - `zrb prune <dataset>` — prunes a single named dataset.
-- `zrb prune --all` — discovers every dataset on the host that has at least one `zrb-`prefixed snapshot (via `zfs list -t snapshot`) and prunes each one. Does not consult the `datasets` map in the config; retention settings are still read from the config file.
+- `zrb prune <dataset> --recursive` — prunes the named dataset and all child datasets.
+- `zrb prune --all` — discovers every dataset on the host that has at least one `zrb-`prefixed snapshot and prunes each one. Does not consult the `datasets` map in the config; retention settings are still read from the config file.
 
 ## Retention Policy
 The tiered ruleset governing which snapshots to keep:
@@ -62,7 +63,12 @@ A fixed 4 MB block of raw ZFS send stream data. Zero-padded when the final chunk
 A 5-byte binary struct appended after each Chunk: `u32 actual_size` (real data bytes in the preceding Chunk) + `u8 has_more` (1 if another Chunk follows, 0 if stream is complete).
 
 ## List
-Displays all zrb-managed snapshots on the local host — a filtered wrapper around `zfs list -t snapshot` showing only snapshots with the `zrb-` prefix. Subcommand: `zrb list`.
+Displays zrb-managed snapshots on the local host, grouped by dataset. Subcommand: `zrb list`.
+
+Three invocation forms:
+- `zrb list` — lists all datasets that have at least one zrb-managed snapshot.
+- `zrb list <dataset>` — lists snapshots for that dataset only.
+- `zrb list <dataset> --recursive` — lists the named dataset and all child datasets. `zrb list --recursive` (no dataset) behaves the same as `zrb list`.
 
 ## Bandwidth Limit
-An optional per-remote cap on transfer throughput, expressed in bytes/sec. Configured as `bandwidth_limit` in the Source's `RemoteConfig`. When set, the send side enforces the limit inside the Protocol's stream-writing layer (one fixed-rate token bucket applied per Chunk). Absent means no cap — the transfer uses whatever the network and ZFS provide.
+An optional per-remote cap on transfer throughput, enforced in bytes/sec internally. Configured as `bandwidth_limit` in the Source's `RemoteConfig` using a human-readable string: an optional SI prefix (`k`/`K` = ×1 000, `m`/`M` = ×1 000 000, `g`/`G` = ×1 000 000 000) and an optional unit suffix (`bit`/`bits` → divide by 8 to convert from bits/sec to bytes/sec; no suffix or trailing `B` → bytes/sec). Decimal values are accepted. A bare integer string is bytes/sec. Examples: `"10M"` = 10 MB/s, `"100Mbit"` = 12.5 MB/s. When set, the send side enforces the limit inside the Protocol's stream-writing layer (one fixed-rate token bucket applied per Chunk). Absent means no cap — the transfer uses whatever the network and ZFS provide.

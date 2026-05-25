@@ -4,6 +4,24 @@ use crate::ops::list as ops_list;
 use crate::retention::policy::{apply, RetentionConfig};
 use crate::zfs::client;
 
+/// Apply the Retention Policy to `dataset` and all child datasets.
+///
+/// # Errors
+/// Propagates errors from `zfs::client::discover_datasets` or any `prune` call.
+pub fn prune_recursive(
+    dataset: &str,
+    config: &RetentionConfig,
+    hold_days: Option<u32>,
+) -> anyhow::Result<Vec<(String, PruneResult)>> {
+    ops_list::datasets_matching(&client::discover_datasets()?, dataset)
+        .into_iter()
+        .map(|ds| {
+            let result = prune(&ds, config, hold_days)?;
+            Ok((ds, result))
+        })
+        .collect()
+}
+
 pub struct PruneResult {
     pub kept: Vec<String>,
     pub deleted: Vec<String>,

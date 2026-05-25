@@ -43,7 +43,18 @@ nix run github:0xCCF4/zrb
 ssh-keygen -t ed25519 -f ~/.ssh/id_zrb -C "zrb backup key"
 ```
 
-### 2. Create a dedicated user on the Remote
+### 2. Grant ZFS permissions on the Source
+
+Delegate the minimum permissions to the user that will run `zrb` on each dataset you intend to back up:
+
+```sh
+zfs allow -u <user> snapshot,send,destroy tank/home
+zfs allow -u <user> snapshot,send,destroy tank/documents
+```
+
+`snapshot` and `send` are required for `zrb send`; `destroy` is required for `zrb prune`.
+
+### 3. Create a dedicated user on the Remote
 
 ```sh
 useradd -r -m -s /bin/bash zfsbackup
@@ -55,7 +66,7 @@ Copy the public key to the Remote:
 ssh-copy-id -i ~/.ssh/id_zrb.pub zfsbackup@backup.example.com
 ```
 
-### 3. Configure SSH ForceCommand on the Remote
+### 4. Configure SSH ForceCommand on the Remote
 
 Edit `/home/zfsbackup/.ssh/authorized_keys` so that the key runs `zrb server` instead of a shell:
 
@@ -66,17 +77,19 @@ command="zrb server --client my-laptop",restrict ssh-ed25519 AAAA... zrb backup 
 The `--client` flag lists which client names this key is permitted to present. A key may serve multiple clients:
 `--client laptop --client desktop`.
 
-### 4. Grant ZFS permissions on the Remote
+### 5. Grant ZFS permissions on the Remote
 
 Delegate only the necessary permissions to the `zfsbackup` user on the dataset subtree it will receive into:
 
 ```sh
-zfs allow -u zfsbackup receive,create,mount backup/laptop
+zfs allow -u <user> receive,create,mount backup/laptop
 ```
 
 Keep the delegation as narrow as possible — per-dataset subtree, not the whole pool.
 
-### 5. Write the Remote config
+**Do not create the target datasets manually.** `zrb` creates them automatically on the first transfer via `zfs receive`. Pre-existing datasets will cause `zfs receive` to fail.
+
+### 6. Write the Remote config
 
 `~/.config/zrb/server.toml` on the Remote:
 
@@ -96,7 +109,7 @@ weekly_for_days = 60
 monthly_for_days = 730
 ```
 
-### 6. Write the Source config
+### 7. Write the Source config
 
 `~/.config/zrb/config.toml` on the Source (default path; override with `--config`):
 
@@ -383,6 +396,10 @@ services.zrb.server.main.clients.my-laptop = {
   zfsReceiveOpts = [ "-c" ];
 };
 ```
+
+## Configuration reference
+
+Full documentation of all config keys for both source and server: [docs/config.md](docs/config.md).
 
 ## Retention policy
 

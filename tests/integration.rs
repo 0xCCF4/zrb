@@ -502,3 +502,29 @@ fn dataset_not_in_allow_list_rejected_end_to_end() {
     let forbidden_snaps = ops_list::list(&forbidden_ds).expect("list forbidden snapshots");
     assert_eq!(forbidden_snaps.len(), 0, "forbidden dataset should have no snapshots after rejection");
 }
+
+#[test]
+#[ignore = "requires ZFS and root privileges"]
+fn list_all_groups_every_dataset_with_zrb_snapshots() {
+    if !zfs_available() { eprintln!("SKIP: /dev/zfs not present — ZFS kernel module unavailable"); return; }
+    let pool = ZfsTestPool::create("zrb-list-all");
+    let ds_a = pool.dataset("alpha");
+    let ds_b = pool.dataset("beta");
+    Command::new("zfs").args(["create", &ds_a]).status().expect("zfs create alpha");
+    Command::new("zfs").args(["create", &ds_b]).status().expect("zfs create beta");
+
+    zfs_client::create_snapshot(&ds_a, "zrb-2026-01-01T00:00:00Z").expect("snap a");
+    zfs_client::create_snapshot(&ds_b, "zrb-2026-01-02T00:00:00Z").expect("snap b");
+    // Non-zrb snapshot — must not appear in list_all output
+    zfs_client::create_snapshot(&ds_b, "manual").expect("manual snap");
+
+    let groups = ops_list::list_all().expect("list_all");
+
+    let alpha = groups.iter().find(|(ds, _)| ds == &ds_a).expect("alpha dataset in list_all");
+    let beta = groups.iter().find(|(ds, _)| ds == &ds_b).expect("beta dataset in list_all");
+
+    assert_eq!(alpha.1.len(), 1);
+    assert!(alpha.1[0].contains("zrb-2026-01-01"));
+    assert_eq!(beta.1.len(), 1);
+    assert!(beta.1[0].contains("zrb-2026-01-02"));
+}
