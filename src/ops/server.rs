@@ -32,7 +32,7 @@ extern "C" fn handle_sighup(_: libc::c_int) {
 ///
 /// # Errors
 /// Returns `Err` on I/O or codec failure.
-pub fn server(config: &ServerConfig, permitted_clients: &[String]) -> anyhow::Result<()> {
+pub async fn server(config: &ServerConfig, permitted_clients: &[String]) -> anyhow::Result<()> {
     CANCEL.store(false, Ordering::Relaxed);
     // SAFETY: signal handlers that only set an AtomicBool are async-signal-safe.
     unsafe {
@@ -44,11 +44,10 @@ pub fn server(config: &ServerConfig, permitted_clients: &[String]) -> anyhow::Re
     }
     let permitted: Vec<&str> = permitted_clients.iter().map(String::as_str).collect();
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let mut input = tokio::io::BufReader::new(tokio::io::stdin());
-        let mut output = tokio::io::stdout();
-        run_server_on(config, &permitted, &mut input, &mut output, &CANCEL).await
-    })
+
+    let mut input = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut output = tokio::io::stdout();
+    run_server_on(config, &permitted, &mut input, &mut output, &CANCEL).await
 }
 
 /// Run the server protocol over arbitrary async `Read`/`Write` streams.
