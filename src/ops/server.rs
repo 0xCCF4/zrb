@@ -43,7 +43,6 @@ pub async fn server(config: &ServerConfig, permitted_clients: &[String]) -> anyh
         );
     }
     let permitted: Vec<&str> = permitted_clients.iter().map(String::as_str).collect();
-    let rt = tokio::runtime::Runtime::new()?;
 
     let mut input = tokio::io::BufReader::new(tokio::io::stdin());
     let mut output = tokio::io::stdout();
