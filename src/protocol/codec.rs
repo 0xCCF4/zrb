@@ -29,6 +29,12 @@ pub struct ServerStatus {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientReady {
+    pub ok: bool,
+    pub message: String,
+}
+
 #[derive(Debug, Error)]
 pub enum CodecError {
     #[error("I/O error: {0}")]
@@ -85,6 +91,23 @@ pub async fn encode_server_status<W: AsyncWrite + Unpin>(
 pub async fn decode_server_status<R: AsyncBufRead + Unpin>(
     src: &mut R,
 ) -> Result<ServerStatus, CodecError> {
+    decode_json(src).await
+}
+
+/// # Errors
+/// Returns `CodecError` on I/O or JSON serialization failure.
+pub async fn encode_client_ready<W: AsyncWrite + Unpin>(
+    msg: &ClientReady,
+    dest: &mut W,
+) -> Result<(), CodecError> {
+    encode_json(msg, dest).await
+}
+
+/// # Errors
+/// Returns `CodecError` on I/O or JSON deserialization failure.
+pub async fn decode_client_ready<R: AsyncBufRead + Unpin>(
+    src: &mut R,
+) -> Result<ClientReady, CodecError> {
     decode_json(src).await
 }
 
@@ -254,6 +277,34 @@ mod tests {
     use super::*;
 
     // ── JSON round-trips ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn client_ready_ok_round_trip() {
+        let msg = ClientReady {
+            ok: true,
+            message: "ok".to_string(),
+        };
+        let mut buf = Vec::new();
+        encode_client_ready(&msg, &mut buf).await.unwrap();
+        let decoded = decode_client_ready(&mut tokio::io::BufReader::new(Cursor::new(&buf)))
+            .await
+            .unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[tokio::test]
+    async fn client_ready_not_ok_round_trip() {
+        let msg = ClientReady {
+            ok: false,
+            message: "newest snapshot already on server".to_string(),
+        };
+        let mut buf = Vec::new();
+        encode_client_ready(&msg, &mut buf).await.unwrap();
+        let decoded = decode_client_ready(&mut tokio::io::BufReader::new(Cursor::new(&buf)))
+            .await
+            .unwrap();
+        assert_eq!(decoded, msg);
+    }
 
     #[tokio::test]
     async fn server_hello_round_trip() {

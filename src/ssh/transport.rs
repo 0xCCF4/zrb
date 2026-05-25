@@ -59,6 +59,7 @@ pub fn connect(
         Some(p) => format!("{}:{}", remote.host, p),
         None => remote.host.clone(),
     };
+    log::debug!("ssh connect {destination}");
     let mut child = cmd.spawn().map_err(|source| TransportError::Spawn {
         destination,
         source,

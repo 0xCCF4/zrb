@@ -29,9 +29,13 @@ Three invocation forms:
 - `zrb prune <dataset> --recursive` — prunes the named dataset and all child datasets.
 - `zrb prune --all` — discovers every dataset on the host that has at least one `zrb-`prefixed snapshot and prunes each one. Does not consult the `datasets` map in the config; retention settings are still read from the config file.
 
+Two modifier flags usable with any of the above forms:
+- `--dry-run` — previews what would be kept and deleted without performing any deletions. If a resume transfer is in progress and the hold period has not elapsed, prints a "skipped" notice instead of a snapshot list.
+- `--abort-resume` — overrides a resume hold: aborts any in-progress resume token and prunes the dataset regardless of the hold period. Without this flag, a dataset whose resume token is within the hold period is skipped.
+
 ## Retention Policy
 The tiered ruleset governing which snapshots to keep:
-- **Recent**: keep the last N snapshots unconditionally
+- **Daily**: keep the last N snapshots unconditionally
 - **Weekly**: beyond N, keep one per week up to 1 month back
 - **Monthly**: beyond 1 month, keep one per month up to 1 year back
 - **Yearly**: beyond 1 year, keep one per year
@@ -44,8 +48,9 @@ The mode in which zrb runs on the Remote, invoked via SSH `ForceCommand`. Handle
 ## Protocol
 The structured communication between client (Source) and server (Remote) over a single SSH connection. The client speaks first:
 1. **Handshake phase** — JSON messages: client sends `ClientHello` (declaring its Client Name, target dataset, and compiled version); server validates the version (major and minor must match) and replies with `ServerStatus` (version accept/reject). If rejected, server closes and client surfaces the message. If accepted, server then sends `ServerHello` (its snapshot list and any pending Resume Token).
-2. **Transfer phase** — binary stream: fixed 4 MB Chunks, each followed by a Control Frame. The client selects the Incremental Base locally (from snapshots common to both sides) and begins streaming immediately after receiving `ServerHello`.
-3. **Status phase** — JSON: server reports success or error after the stream ends.
+2. **Ready phase** — JSON: client sends `ClientReady` after evaluating whether it has data to send. If `ok: false` (e.g. newest snapshot already on the Remote), the server exits cleanly without spawning `zfs receive`. If `ok: true`, the transfer phase begins.
+3. **Transfer phase** — binary stream: fixed 4 MB Chunks, each followed by a Control Frame. The client selects the Incremental Base locally (from snapshots common to both sides) and begins streaming immediately after `ClientReady`.
+4. **Status phase** — JSON: server reports success or error after the stream ends.
 
 ## Resume Token
 A ZFS-native opaque string saved by `zfs receive -s` when a transfer is interrupted mid-stream. Retrieved via `zfs get receive_resume_token <dataset>`. When present, the client issues `zfs send -t <token>` instead of a normal Incremental Send. The Remote discards the token (via `zfs receive -A`) when Prune runs on the target dataset, after which the next Send retries from scratch.

@@ -35,6 +35,7 @@ fn run(mut cmd: Command) -> Result<String, ClientError> {
 /// # Errors
 /// Returns [`ClientError`] if the `zfs` process cannot be spawned or exits non-zero.
 pub fn create_snapshot(dataset: &str, snapshot_name: &str) -> Result<(), ClientError> {
+    log::trace!("zfs snapshot {dataset}@{snapshot_name}");
     let mut cmd = Command::new("zfs");
     cmd.arg("snapshot")
         .arg(format!("{dataset}@{snapshot_name}"));
@@ -46,6 +47,7 @@ pub fn create_snapshot(dataset: &str, snapshot_name: &str) -> Result<(), ClientE
 /// # Errors
 /// Returns [`ClientError`] if the `zfs` process cannot be spawned or exits non-zero.
 pub fn list_snapshots(dataset: &str) -> Result<Vec<String>, ClientError> {
+    log::trace!("zfs list snapshots for {dataset}");
     let mut cmd = Command::new("zfs");
     cmd.args(["list", "-t", "snapshot", "-H", "-o", "name", dataset]);
     match run(cmd) {
@@ -76,9 +78,10 @@ pub fn destroy_snapshot(snapshot: &str) -> Result<(), ClientError> {
     assert!(
         snapshot
             .split_once('@')
-            .is_some_and(|(_, name)| name.starts_with("zrb-")),
+            .is_some_and(|(_, name)| name.starts_with("zrb-")) && snapshot.split('@').count() == 2,
         "Guardrail tripped: not a zrb snapshot: {snapshot}"
     );
+    log::trace!("zfs destroy {snapshot}");
     let mut cmd = Command::new("zfs");
     cmd.arg("destroy").arg(snapshot);
     run(cmd).map(|_| ())
@@ -96,6 +99,10 @@ pub fn send_incremental(
     snapshot: &str,
     opts: &[String],
 ) -> Result<TokioChildStdout, ClientError> {
+    match base {
+        Some(b) => log::trace!("zfs send -i {b} {snapshot}"),
+        None => log::trace!("zfs send {snapshot} (full)"),
+    }
     let mut cmd = TokioCommand::new("zfs");
     cmd.arg("send");
     if let Some(b) = base {
@@ -116,6 +123,7 @@ pub fn send_incremental(
 /// # Panics
 /// Never panics — stdout is always present because `Stdio::piped()` is set unconditionally.
 pub fn send_resume(token: &str, opts: &[String]) -> Result<TokioChildStdout, ClientError> {
+    log::trace!("zfs send -t {}… (resume)", &token[..token.len().min(16)]);
     let mut cmd = TokioCommand::new("zfs");
     cmd.args(["send", "-t", token]);
     cmd.args(opts);
@@ -161,6 +169,7 @@ impl ZfsReceive {
 /// # Panics
 /// Never panics — stdin is always present because `Stdio::piped()` is set unconditionally.
 pub fn receive(dataset: &str, opts: &[String]) -> Result<ZfsReceive, ClientError> {
+    log::trace!("zfs receive -s {dataset}");
     let mut cmd = TokioCommand::new("zfs");
     cmd.args(["receive", "-s", dataset]);
     cmd.args(opts);
@@ -175,6 +184,7 @@ pub fn receive(dataset: &str, opts: &[String]) -> Result<ZfsReceive, ClientError
 /// # Errors
 /// Returns [`ClientError`] if the process cannot be spawned or exits non-zero.
 pub fn abort_resume(dataset: &str) -> Result<(), ClientError> {
+    log::trace!("zfs receive -A {dataset}");
     let mut cmd = Command::new("zfs");
     cmd.args(["receive", "-A", dataset]);
     run(cmd).map(|_| ())
@@ -187,6 +197,7 @@ pub fn abort_resume(dataset: &str) -> Result<(), ClientError> {
 /// # Errors
 /// Returns [`ClientError`] if the process cannot be spawned or exits non-zero.
 pub fn get_resume_token(dataset: &str) -> Result<Option<String>, ClientError> {
+    log::trace!("zfs get receive_resume_token {dataset}");
     let mut cmd = Command::new("zfs");
     cmd.args(["get", "-H", "-o", "value", "receive_resume_token", dataset]);
     match run(cmd) {
@@ -209,6 +220,7 @@ fn parse_resume_token(value: &str) -> Option<String> {
 /// # Errors
 /// Returns [`ClientError`] if the `zfs` process cannot be spawned or exits non-zero.
 pub fn discover_datasets() -> Result<Vec<String>, ClientError> {
+    log::trace!("zfs list (discovering zrb-managed datasets)");
     let mut cmd = Command::new("zfs");
     cmd.args(["list", "-t", "snapshot", "-H", "-o", "name"]);
     let output = run(cmd)?;
@@ -223,6 +235,7 @@ pub fn discover_datasets() -> Result<Vec<String>, ClientError> {
 /// # Errors
 /// Returns [`ClientError`] if the process cannot be spawned or exits non-zero.
 pub fn get_resume_since(dataset: &str) -> Result<Option<DateTime<Utc>>, ClientError> {
+    log::trace!("zfs get zrb:resume-since {dataset}");
     let mut cmd = Command::new("zfs");
     cmd.args(["get", "-H", "-o", "value", "zrb:resume-since", dataset]);
     match run(cmd) {
@@ -247,6 +260,7 @@ fn parse_resume_since(value: &str) -> Option<DateTime<Utc>> {
 /// # Errors
 /// Returns [`ClientError`] if the process cannot be spawned or exits non-zero.
 pub fn set_resume_since(dataset: &str, ts: DateTime<Utc>) -> Result<(), ClientError> {
+    log::trace!("zfs set zrb:resume-since={ts} {dataset}");
     let value = ts.to_rfc3339();
     let mut cmd = Command::new("zfs");
     cmd.args(["set", &format!("zrb:resume-since={value}"), dataset]);
@@ -261,6 +275,7 @@ pub fn set_resume_since(dataset: &str, ts: DateTime<Utc>) -> Result<(), ClientEr
 /// # Errors
 /// Returns [`ClientError`] if the process cannot be spawned or exits non-zero.
 pub fn clear_resume_since(dataset: &str) -> Result<(), ClientError> {
+    log::trace!("zfs inherit zrb:resume-since {dataset}");
     let mut cmd = Command::new("zfs");
     cmd.args(["inherit", "zrb:resume-since", dataset]);
     run(cmd).map(|_| ())

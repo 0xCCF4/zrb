@@ -9,7 +9,7 @@ use tokio::task::JoinSet;
 
 use crate::config::{RemoteConfig, RemoteTargets, SourceConfig};
 use crate::ops::{list as ops_list, snapshot as ops_snapshot};
-use crate::protocol::codec::{self, ClientHello};
+use crate::protocol::codec::{self, ClientHello, ClientReady};
 use crate::ssh::transport;
 use crate::zfs::{client as zfs, estimator};
 
@@ -291,6 +291,7 @@ async fn send_to_remote(
     if sequential && tty {
         eprintln!();
     }
+    drop(conn.stdin);
     let _ = conn.child.wait().await;
 
     if result.is_ok() {
@@ -348,6 +349,7 @@ async fn resume_to_remote(
     if sequential && tty {
         eprintln!();
     }
+    drop(conn.stdin);
     let _ = conn.child.wait().await;
 
     if result.is_ok() {
@@ -375,7 +377,7 @@ async fn resume_to_remote(
 ///
 /// # Errors
 /// Returns `Err` on I/O, codec, or remote protocol failure.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn send_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     latest: &str,
     local_snaps: &[String],
@@ -408,13 +410,17 @@ pub async fn send_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         .await
         .context("reading ServerHello")?;
 
-    let (mut zfs_out, total_bytes) = if let Some(ref token) = hello.resume_token {
-        let out = zfs::send_resume(token, &remote_cfg.zfs_send_opts).context("zfs send -t")?;
-        (out, 0u64)
+    log::debug!("server has {} snapshot(s)", hello.snapshots.len());
+
+    // Server snapshots use the destination dataset prefix; local snapshots use
+    // the source dataset prefix.  Compare only the @name suffix (timestamp) so
+    // that snapshots which exist on both sides are recognised as common.
+    let stream_res = if let Some(ref token) = hello.resume_token {
+        log::debug!("resume token present; using zfs send -t");
+        zfs::send_resume(token, &remote_cfg.zfs_send_opts)
+            .context("zfs send -t")
+            .map(|out| (out, 0u64))
     } else {
-        // Server snapshots use the destination dataset prefix; local snapshots use
-        // the source dataset prefix.  Compare only the @name suffix (timestamp) so
-        // that snapshots which exist on both sides are recognised as common.
         let server_names: std::collections::HashSet<&str> = hello
             .snapshots
             .iter()
@@ -428,18 +434,56 @@ pub async fn send_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             })
             .cloned()
             .collect();
-        let best = best_base(&common, |cand| {
+        log::debug!(
+            "{} local, {} server, {} common snapshot(s)",
+            local_snaps.len(),
+            hello.snapshots.len(),
+            common.len()
+        );
+        best_base(&common, |cand| {
             let c = cand.to_owned();
             let opts = remote_cfg.zfs_send_opts.clone();
             let l = latest.to_owned();
             async move { estimate_size(&c, &l, &opts).await }
         })
         .await
-        .context("selecting incremental base")?;
-        let (base_snap, estimate) = best.map_or((None, 0u64), |(s, e)| (Some(s), e));
-        let out = zfs::send_incremental(base_snap.as_deref(), latest, &remote_cfg.zfs_send_opts)
-            .context("zfs send")?;
-        (out, estimate)
+        .context("selecting incremental base")
+        .and_then(|best| {
+            let (base_snap, estimate) = best.map_or((None, 0u64), |(s, e)| (Some(s), e));
+            match &base_snap {
+                Some(s) => log::debug!("incremental base: {s} (~{estimate} bytes estimated)"),
+                None => log::debug!("no common snapshots; sending full stream"),
+            }
+            zfs::send_incremental(base_snap.as_deref(), latest, &remote_cfg.zfs_send_opts)
+                .context("zfs send")
+                .map(|out| (out, estimate))
+        })
+    };
+
+    let (mut zfs_out, total_bytes) = match stream_res {
+        Ok(pair) => {
+            codec::encode_client_ready(
+                &ClientReady {
+                    ok: true,
+                    message: "ok".to_owned(),
+                },
+                writer,
+            )
+            .await
+            .context("writing ClientReady")?;
+            pair
+        }
+        Err(e) => {
+            let _ = codec::encode_client_ready(
+                &ClientReady {
+                    ok: false,
+                    message: e.to_string(),
+                },
+                writer,
+            )
+            .await;
+            return Err(e);
+        }
     };
 
     codec::write_stream(
@@ -474,7 +518,7 @@ pub async fn send_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
 /// # Errors
 /// Returns `Err` on I/O, codec, remote protocol failure, or if the newest
 /// snapshot is already present on the Remote.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     latest: &str,
     local_snaps: &[String],
@@ -507,9 +551,13 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         .await
         .context("reading ServerHello")?;
 
-    let (mut zfs_out, total_bytes) = if let Some(ref token) = hello.resume_token {
-        let out = zfs::send_resume(token, &remote_cfg.zfs_send_opts).context("zfs send -t")?;
-        (out, 0u64)
+    log::debug!("server has {} snapshot(s)", hello.snapshots.len());
+
+    let stream_res = if let Some(ref token) = hello.resume_token {
+        log::debug!("resume token present; using zfs send -t");
+        zfs::send_resume(token, &remote_cfg.zfs_send_opts)
+            .context("zfs send -t")
+            .map(|out| (out, 0u64))
     } else {
         let latest_suffix = latest.split_once('@').map_or(latest, |(_, n)| n);
         let on_server = hello
@@ -517,35 +565,74 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             .iter()
             .any(|s| s.split_once('@').is_some_and(|(_, n)| n == latest_suffix));
         if on_server {
-            return Err(anyhow::anyhow!(
+            Err(anyhow::anyhow!(
                 "newest snapshot already on server; run `zrb send` to create a fresh backup"
-            ));
-        }
-        let server_names: std::collections::HashSet<&str> = hello
-            .snapshots
-            .iter()
-            .filter_map(|s| s.split_once('@').map(|(_, n)| n))
-            .collect();
-        let common: Vec<String> = local_snaps
-            .iter()
-            .filter(|s| {
-                s.split_once('@')
-                    .is_some_and(|(_, n)| server_names.contains(n))
+            ))
+        } else {
+            let server_names: std::collections::HashSet<&str> = hello
+                .snapshots
+                .iter()
+                .filter_map(|s| s.split_once('@').map(|(_, n)| n))
+                .collect();
+            let common: Vec<String> = local_snaps
+                .iter()
+                .filter(|s| {
+                    s.split_once('@')
+                        .is_some_and(|(_, n)| server_names.contains(n))
+                })
+                .cloned()
+                .collect();
+            log::debug!(
+                "{} local, {} server, {} common snapshot(s)",
+                local_snaps.len(),
+                hello.snapshots.len(),
+                common.len()
+            );
+            best_base(&common, |cand| {
+                let c = cand.to_owned();
+                let opts = remote_cfg.zfs_send_opts.clone();
+                let l = latest.to_owned();
+                async move { estimate_size(&c, &l, &opts).await }
             })
-            .cloned()
-            .collect();
-        let best = best_base(&common, |cand| {
-            let c = cand.to_owned();
-            let opts = remote_cfg.zfs_send_opts.clone();
-            let l = latest.to_owned();
-            async move { estimate_size(&c, &l, &opts).await }
-        })
-        .await
-        .context("selecting incremental base")?;
-        let (base_snap, estimate) = best.map_or((None, 0u64), |(s, e)| (Some(s), e));
-        let out = zfs::send_incremental(base_snap.as_deref(), latest, &remote_cfg.zfs_send_opts)
-            .context("zfs send")?;
-        (out, estimate)
+            .await
+            .context("selecting incremental base")
+            .and_then(|best| {
+                let (base_snap, estimate) = best.map_or((None, 0u64), |(s, e)| (Some(s), e));
+                match &base_snap {
+                    Some(s) => log::debug!("incremental base: {s} (~{estimate} bytes estimated)"),
+                    None => log::debug!("no common snapshots; sending full stream"),
+                }
+                zfs::send_incremental(base_snap.as_deref(), latest, &remote_cfg.zfs_send_opts)
+                    .context("zfs send")
+                    .map(|out| (out, estimate))
+            })
+        }
+    };
+
+    let (mut zfs_out, total_bytes) = match stream_res {
+        Ok(pair) => {
+            codec::encode_client_ready(
+                &ClientReady {
+                    ok: true,
+                    message: "ok".to_owned(),
+                },
+                writer,
+            )
+            .await
+            .context("writing ClientReady")?;
+            pair
+        }
+        Err(e) => {
+            let _ = codec::encode_client_ready(
+                &ClientReady {
+                    ok: false,
+                    message: e.to_string(),
+                },
+                writer,
+            )
+            .await;
+            return Err(e);
+        }
     };
 
     codec::write_stream(
@@ -584,7 +671,9 @@ async fn estimate_size(candidate: &str, latest: &str, opts: &[String]) -> anyhow
         .await
         .context("running zfs send -n -v")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    estimator::parse_estimated_size(&stdout).map_err(|e| anyhow::anyhow!("{e}"))
+    let size = estimator::parse_estimated_size(&stdout).map_err(|e| anyhow::anyhow!("{e}"))?;
+    log::trace!("size estimate {candidate} → {latest}: {size} bytes");
+    Ok(size)
 }
 
 async fn best_base<F, Fut>(common: &[String], estimate: F) -> anyhow::Result<Option<(String, u64)>>
@@ -703,6 +792,42 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("already on server")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_on_writes_client_not_ready_when_newest_snapshot_already_on_server() {
+        let latest = "tank/home@zrb-2026-01-20T00:00:00Z";
+        let local_snaps = vec![latest.to_owned()];
+        let hello = ServerHello {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            snapshots: vec!["backup/home@zrb-2026-01-20T00:00:00Z".to_owned()],
+            resume_token: None,
+        };
+        let reader_bytes = version_ok_then_hello(&hello).await;
+        let mut writer: Vec<u8> = Vec::new();
+
+        let _ = super::resume_on(
+            latest,
+            &local_snaps,
+            &test_remote_cfg(),
+            "backup/home",
+            "my-laptop",
+            &mut tokio::io::BufReader::new(Cursor::new(reader_bytes)),
+            &mut writer,
+            None,
+        )
+        .await;
+
+        // writer has ClientHello then ClientReady — skip past ClientHello
+        let mut r = tokio::io::BufReader::new(Cursor::new(&writer));
+        let _: codec::ClientHello = codec::decode_client_hello(&mut r).await.unwrap();
+        let ready = codec::decode_client_ready(&mut r).await.unwrap();
+        assert!(!ready.ok, "expected ClientReady.ok=false, got ok=true");
+        assert!(
+            ready.message.contains("already on server"),
+            "unexpected ClientReady message: {}",
+            ready.message
         );
     }
 

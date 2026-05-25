@@ -76,7 +76,7 @@ src/
 ├── config.rs        — SourceConfig / ServerConfig TOML parsing
 ├── snapshot/        — snapshot naming (zrb- prefix + UTC timestamp)
 ├── retention/       — RetentionPolicy; decides which snapshots to delete
-├── protocol/        — wire types (ClientHello, ServerHello, ServerStatus, Chunk, ControlFrame)
+├── protocol/        — wire types (ClientHello, ServerHello, ServerStatus, ClientReady, Chunk, ControlFrame)
 │   └── codec.rs     — JSON + binary framing; read/write helpers
 ├── zfs/             — thin wrappers around zfs(8) and zpool(8) subprocesses
 │   ├── client.rs    — zfs list, zfs send, zfs receive, zfs destroy
@@ -86,8 +86,8 @@ src/
 └── ops/             — one file per subcommand
     ├── snapshot.rs  — zrb snapshot
     ├── list.rs      — zrb list
-    ├── send.rs      — zrb send (and --resume variant)
-    ├── prune.rs     — zrb prune / prune --all
+    ├── send.rs      — zrb send / zrb send --resume
+    ├── prune.rs     — zrb prune / prune --all / prune --dry-run / prune --abort-resume
     └── server.rs    — zrb server (ForceCommand handler)
 ```
 
@@ -107,7 +107,7 @@ The Remote never dials out. All coordination flows over the single SSH stdio pip
 
 ## Protocol orientation
 
-Three phases over one SSH connection:
+Four phases over one SSH connection:
 
 **1. Handshake (JSON)**
 
@@ -124,12 +124,23 @@ exits. No transfer happens.
 After accepting, the server sends its snapshot list and any pending resume token. The client picks the incremental base
 locally by estimating transfer size (`zfs send -n -v`) for each common snapshot and choosing the smallest.
 
-**2. Transfer (binary)**
+**2. Ready (JSON)**
+
+```
+Source → Remote   ClientReady  { ok: bool, message? }
+```
+
+The client signals whether it actually has data to send. `ok: false` means nothing to transfer (e.g. the newest
+snapshot is already on the Remote); the server exits cleanly without spawning `zfs receive`. `ok: true` starts the
+transfer phase. This step prevents a deadlock that occurs when the client decides not to send but the server has
+already started waiting for stream data (ADR 0007).
+
+**3. Transfer (binary)**
 
 Fixed 4 MB `Chunk`s, each followed by a 5-byte `ControlFrame` (`u32 actual_size` + `u8 has_more`). If a resume token was
 present, the client issues `zfs send -t <token>` — incremental base selection is bypassed entirely.
 
-**3. Status (JSON)**
+**4. Status (JSON)**
 
 ```
 Remote → Source   ServerStatus { ok: bool, message? }
