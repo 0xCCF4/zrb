@@ -4,25 +4,6 @@ use crate::ops::list as ops_list;
 use crate::retention::policy::{KeepReason, RetentionConfig, apply};
 use crate::zfs::client;
 
-/// Apply the Retention Policy to `dataset` and all child datasets.
-///
-/// # Errors
-/// Propagates errors from `zfs::client::discover_datasets` or any `prune` call.
-pub fn prune_recursive(
-    dataset: &str,
-    config: &RetentionConfig,
-    hold_days: Option<u32>,
-    dry_run: bool,
-    abort_resume: bool,
-) -> anyhow::Result<Vec<(String, PruneResult)>> {
-    ops_list::datasets_matching(&client::discover_datasets()?, dataset)
-        .into_iter()
-        .map(|ds| {
-            let result = prune(&ds, config, hold_days, dry_run, abort_resume)?;
-            Ok((ds, result))
-        })
-        .collect()
-}
 
 pub struct PruneResult {
     pub kept: Vec<(String, KeepReason)>,
@@ -63,28 +44,6 @@ pub(crate) fn resume_decision(
     }
 }
 
-/// Discover all datasets with `zrb-` snapshots and prune each with `config`.
-///
-/// `hold_days` comes from `ServerConfig::resume_hold_days`; pass `None` on the
-/// source side where resume tokens are not applicable.
-///
-/// # Errors
-/// Propagates errors from `zfs::client::discover_datasets` or any `prune` call.
-pub fn prune_all(
-    config: &RetentionConfig,
-    hold_days: Option<u32>,
-    dry_run: bool,
-    abort_resume: bool,
-) -> anyhow::Result<Vec<(String, PruneResult)>> {
-    let datasets = client::discover_datasets()?;
-    datasets
-        .into_iter()
-        .map(|ds| {
-            let result = prune(&ds, config, hold_days, dry_run, abort_resume)?;
-            Ok((ds, result))
-        })
-        .collect()
-}
 
 /// Apply the Retention Policy to `dataset` and destroy out-of-policy snapshots.
 ///

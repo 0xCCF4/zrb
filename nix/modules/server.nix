@@ -89,6 +89,20 @@ let
           }
         '';
       };
+      prune = {
+        onCalendar = mkOption {
+          type = nullOr str;
+          default = null;
+          description = "systemd calendar expression for pruning, or null to disable.";
+          example = "weekly";
+        };
+        persistent = mkOption {
+          type = bool;
+          default = true;
+          description = "Whether the prune timer is persistent (catches up missed runs after downtime).";
+          example = false;
+        };
+      };
     };
   };
 
@@ -118,6 +132,40 @@ in
   };
 
   config = {
+    systemd.services = mkMerge (
+      mapAttrsToList
+        (name: icfg:
+          mkIf (icfg.enable && icfg.prune.onCalendar != null) {
+            "zrb-server-prune-${name}" = {
+              description = "zrb prune for server instance '${name}'";
+              serviceConfig = {
+                Type = "oneshot";
+                User = icfg.user;
+                ExecStart = "${icfg.package}/bin/zrb prune --config /etc/zrb/${name}/server.toml";
+              };
+            };
+          }
+        )
+        enabledInstances
+    );
+
+    systemd.timers = mkMerge (
+      mapAttrsToList
+        (name: icfg:
+          mkIf (icfg.enable && icfg.prune.onCalendar != null) {
+            "zrb-server-prune-${name}" = {
+              description = "Timer for zrb prune on server instance '${name}'";
+              wantedBy = [ "timers.target" ];
+              timerConfig = {
+                OnCalendar = icfg.prune.onCalendar;
+                Persistent = icfg.prune.persistent;
+              };
+            };
+          }
+        )
+        enabledInstances
+    );
+
     environment.etc = mapAttrs'
       (name: icfg:
         nameValuePair "zrb/${name}/server.toml" {

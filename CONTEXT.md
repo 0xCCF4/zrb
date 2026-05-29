@@ -24,12 +24,11 @@ The snapshot chosen as the base for `zfs send -i`. Selected by estimating the tr
 ## Prune
 The operation of deleting snapshots that fall outside the Retention Policy. Runs locally on whichever host invokes it — Source and Remote prune independently. No cross-host communication. Subcommand: `zrb prune`.
 
-Three invocation forms:
-- `zrb prune <dataset>` — prunes a single named dataset.
-- `zrb prune <dataset> --recursive` — prunes the named dataset and all child datasets.
-- `zrb prune --all` — discovers every dataset on the host that has at least one `zrb-`prefixed snapshot and prunes each one. Does not consult the `datasets` map in the config; retention settings are still read from the config file.
+Two invocation forms:
+- `zrb prune` — reads the target dataset list from the config file (source config: keys of the `datasets` map; server config: union of all `clients.<name>.allow` lists) and prunes each one in order. Aborts on the first failure.
+- `zrb prune <dataset> [<dataset>...]` — prunes exactly the listed datasets; ignores the config's dataset list.
 
-Two modifier flags usable with any of the above forms:
+Two modifier flags usable with either form:
 - `--dry-run` — previews what would be kept and deleted without performing any deletions. If a resume transfer is in progress and the hold period has not elapsed, prints a "skipped" notice instead of a snapshot list.
 - `--abort-resume` — overrides a resume hold: aborts any in-progress resume token and prunes the dataset regardless of the hold period. Without this flag, a dataset whose resume token is within the hold period is skipped.
 
