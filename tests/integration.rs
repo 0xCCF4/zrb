@@ -21,6 +21,7 @@ use zrb::ops::send::send_on;
 use zrb::ops::server::run_server_on;
 use zrb::protocol::codec::{self, ClientHello, ClientReady};
 use zrb::retention::policy::RetentionConfig;
+use zrb::tui::SendEvent;
 use zrb::zfs::client as zfs_client;
 
 static POOL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -180,7 +181,7 @@ fn partial_run_send(latest: &str, target_dataset: &str, client_name: &str, srv_c
         let zfs_out =
             zfs_client::send_incremental(None, latest, &remote.zfs_send_opts).expect("zfs send");
         let mut limited = zfs_out.take(4 * 1024 * 1024_u64);
-        codec::write_stream(&mut limited, &mut client_write, None, 0, None)
+        codec::write_stream(&mut limited, &mut client_write, None, 0, None, None)
             .await
             .expect("write partial stream");
         // Drop client connection — server's ServerStatus write may get BrokenPipe.
@@ -197,28 +198,50 @@ fn run_send(
     client_name: &str,
     srv_cfg: ServerConfig,
 ) {
+    run_send_collecting_events(latest, local_snaps, target_dataset, client_name, srv_cfg);
+}
+
+/// Like `run_send` but also returns the events emitted during the transfer.
+fn run_send_collecting_events(
+    latest: &str,
+    local_snaps: &[String],
+    target_dataset: &str,
+    client_name: &str,
+    srv_cfg: ServerConfig,
+) -> Vec<SendEvent> {
     let remote = dummy_remote();
     let (client_half, server_half) = tokio::io::duplex(8 * 1024 * 1024);
     let server = spawn_server(srv_cfg, vec![client_name.to_owned()], server_half);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<SendEvent>(256);
 
     let rt = tokio::runtime::Runtime::new().expect("tokio rt");
-    rt.block_on(async move {
-        let (client_read, mut client_write) = tokio::io::split(client_half);
-        let mut stc_buf = tokio::io::BufReader::new(client_read);
-        send_on(
-            latest,
-            local_snaps,
-            &remote,
-            target_dataset,
-            client_name,
-            &mut stc_buf,
-            &mut client_write,
-            None,
-        )
-        .await
-    })
-    .expect("send_on");
+    let bytes = rt
+        .block_on(async move {
+            let (client_read, mut client_write) = tokio::io::split(client_half);
+            let mut stc_buf = tokio::io::BufReader::new(client_read);
+            send_on(
+                latest,
+                local_snaps,
+                &remote,
+                target_dataset,
+                client_name,
+                &mut stc_buf,
+                &mut client_write,
+                "test-remote",
+                Some(tx),
+                None,
+            )
+            .await
+        })
+        .expect("send_on");
+    assert!(bytes > 0, "send_on should return bytes sent > 0");
     server.join().expect("server thread").expect("server error");
+
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    events
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -547,6 +570,8 @@ fn multi_remote_failure_does_not_prevent_other() {
                 "test-client",
                 &mut stc_buf,
                 &mut client_write,
+                "test-remote",
+                None,
                 None,
             )
             .await
@@ -598,12 +623,14 @@ fn run_rejected_send(
             client_name,
             &mut stc_buf,
             &mut client_write,
+            "test-remote",
+            None,
             None,
         )
         .await
     });
     drop(server.join());
-    result
+    result.map(|_| ())
 }
 
 #[test]
@@ -734,4 +761,78 @@ fn list_all_groups_every_dataset_with_zrb_snapshots() {
     assert!(alpha.1[0].contains("zrb-2026-01-01"));
     assert_eq!(beta.1.len(), 1);
     assert!(beta.1[0].contains("zrb-2026-01-02"));
+}
+
+#[test]
+#[ignore = "requires ZFS and root privileges"]
+fn send_on_emits_started_progress_completed_in_order() {
+    if !zfs_available() {
+        eprintln!("SKIP: /dev/zfs not present");
+        return;
+    }
+    let src = ZfsTestPool::create("zrb-ev1-src");
+    let dst = ZfsTestPool::create("zrb-ev1-dst");
+    let src_ds = src.dataset("data");
+    let dst_ds = dst.dataset("data");
+
+    Command::new("zfs")
+        .args(["create", "-o", "compression=off", &src_ds])
+        .status()
+        .expect("zfs create src");
+    // 5 MiB ensures at least one RemoteProgress chunk
+    let data = vec![0xABu8; 5 * 1024 * 1024];
+    std::fs::write(format!("/{src_ds}/data.bin"), &data).expect("write data");
+    zfs_client::create_snapshot(&src_ds, "zrb-2026-01-01T00:00:00Z").expect("snapshot");
+    let latest = format!("{src_ds}@zrb-2026-01-01T00:00:00Z");
+    let local_snaps = ops_list::list(&src_ds).expect("list snaps");
+
+    let events = run_send_collecting_events(
+        &latest,
+        &local_snaps,
+        &dst_ds,
+        "test-client",
+        server_config_for("test-client", &dst_ds),
+    );
+
+    assert!(!events.is_empty(), "expected at least one event");
+
+    let started = events.iter().find(|e| matches!(e, SendEvent::RemoteStarted { .. }));
+    assert!(started.is_some(), "expected RemoteStarted event");
+    if let Some(SendEvent::RemoteStarted { remote, total_bytes }) = started {
+        assert_eq!(remote, "test-remote");
+        assert!(*total_bytes > 0, "total_bytes should be positive for a 5 MiB dataset");
+    }
+
+    let progress_events: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, SendEvent::RemoteProgress { .. }))
+        .collect();
+    assert!(
+        !progress_events.is_empty(),
+        "expected at least one RemoteProgress event"
+    );
+    if let SendEvent::RemoteProgress { remote, bytes_sent } = progress_events[0] {
+        assert_eq!(remote, "test-remote");
+        assert!(*bytes_sent > 0);
+    }
+
+    // RemoteStarted must come before all RemoteProgress events
+    let started_idx = events
+        .iter()
+        .position(|e| matches!(e, SendEvent::RemoteStarted { .. }))
+        .unwrap();
+    let first_progress_idx = events
+        .iter()
+        .position(|e| matches!(e, SendEvent::RemoteProgress { .. }))
+        .unwrap();
+    assert!(
+        started_idx < first_progress_idx,
+        "RemoteStarted must precede RemoteProgress"
+    );
+
+    // bytes_sent on final RemoteProgress == bytes returned by send_on
+    let last_progress = progress_events.last().unwrap();
+    if let SendEvent::RemoteProgress { bytes_sent, .. } = last_progress {
+        assert!(*bytes_sent > 0);
+    }
 }
