@@ -65,10 +65,10 @@ ssh-keygen -t ed25519 -f ~/.ssh/id_zrb -C "zrb backup key"
 Delegate the minimum permissions to the user that will run `zrb` on each dataset you intend to back up:
 
 ```sh
-zfs allow -u <user> snapshot,send,destroy tank/home
+zfs allow -u <user> snapshot,send,destroy,mount tank/home
 ```
 
-`snapshot` and `send` are required for `zrb send`; `destroy` is required for `zrb prune`.
+`snapshot` and `send` are required for `zrb send`; `destroy,mount` is required for `zrb prune`.
 
 ### 3. Create a dedicated user on the Remote
 
@@ -98,7 +98,7 @@ The `--client` flag lists which client names this key is permitted to present. A
 Delegate only the necessary permissions to the `zfsbackup` user on the dataset subtree it will receive into:
 
 ```sh
-zfs allow -u <user> receive,create,mount backup/laptop
+zfs allow -u <user> receive,create,destroy,mount backup/laptop
 ```
 
 Keep the delegation as narrow as possible — per-dataset subtree, not the whole pool.

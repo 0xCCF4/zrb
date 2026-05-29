@@ -41,6 +41,8 @@ pub enum CodecError {
     Io(#[from] io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("transfer cancelled by user")]
+    Cancelled,
 }
 
 /// # Errors
@@ -151,6 +153,7 @@ pub async fn write_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     rate_limit: Option<u64>,
     total_bytes: u64,
     mut progress: Option<&mut (dyn FnMut(u64, u64) + Send)>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<(), CodecError> {
     let mut cur = vec![0u8; CHUNK_SIZE];
     let mut nxt = vec![0u8; CHUNK_SIZE];
@@ -183,6 +186,10 @@ pub async fn write_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
         if let Some(ref mut cb) = progress {
             cb(bytes_sent, total_bytes);
+        }
+
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Err(CodecError::Cancelled);
         }
 
         if !has_more {
@@ -371,7 +378,7 @@ mod tests {
     async fn stream_round_trip_arbitrary_bytes() {
         let original: Vec<u8> = (0u8..=255).cycle().take(2_500_000).collect();
         let mut wire = Vec::new();
-        write_stream(&mut Cursor::new(&original), &mut wire, None, 0, None)
+        write_stream(&mut Cursor::new(&original), &mut wire, None, 0, None, None)
             .await
             .unwrap();
         let mut recovered = Vec::new();
@@ -385,7 +392,7 @@ mod tests {
     async fn exactly_one_chunk_control_frame() {
         let data = vec![0xABu8; CHUNK_SIZE];
         let mut wire = Vec::new();
-        write_stream(&mut Cursor::new(&data), &mut wire, None, 0, None)
+        write_stream(&mut Cursor::new(&data), &mut wire, None, 0, None, None)
             .await
             .unwrap();
 
@@ -405,7 +412,7 @@ mod tests {
     async fn partial_chunk_zero_padded_correct_actual_size() {
         let data = vec![0xFFu8; 42];
         let mut wire = Vec::new();
-        write_stream(&mut Cursor::new(&data), &mut wire, None, 0, None)
+        write_stream(&mut Cursor::new(&data), &mut wire, None, 0, None, None)
             .await
             .unwrap();
 
@@ -434,6 +441,7 @@ mod tests {
             None,
             total,
             Some(cb),
+            None,
         )
         .await
         .unwrap();
@@ -447,7 +455,7 @@ mod tests {
         use std::sync::atomic::AtomicBool;
         let original: Vec<u8> = (0u8..=255).cycle().take(2_500_000).collect();
         let mut wire = Vec::new();
-        write_stream(&mut Cursor::new(&original), &mut wire, None, 0, None)
+        write_stream(&mut Cursor::new(&original), &mut wire, None, 0, None, None)
             .await
             .unwrap();
         let cancel = AtomicBool::new(false);
@@ -465,7 +473,7 @@ mod tests {
         // Three chunks; cancel is pre-set; should return Ok(true) after first chunk
         let data: Vec<u8> = (0u8..=255).cycle().take(CHUNK_SIZE * 3).collect();
         let mut wire = Vec::new();
-        write_stream(&mut Cursor::new(&data), &mut wire, None, 0, None)
+        write_stream(&mut Cursor::new(&data), &mut wire, None, 0, None, None)
             .await
             .unwrap();
         let cancel = AtomicBool::new(true);
@@ -480,7 +488,7 @@ mod tests {
     async fn progress_none_is_zero_overhead() {
         let data = vec![1u8; 100];
         let mut out = Vec::new();
-        write_stream(&mut Cursor::new(&data), &mut out, None, 0, None)
+        write_stream(&mut Cursor::new(&data), &mut out, None, 0, None, None)
             .await
             .unwrap();
         let mut recovered = Vec::new();
@@ -502,6 +510,7 @@ mod tests {
             Some(rate),
             0,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -513,10 +522,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_stream_cancelled_token_returns_cancelled_error() {
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+
+        let data = b"hello world";
+        let result = write_stream(
+            &mut Cursor::new(data),
+            &mut tokio::io::sink(),
+            None,
+            data.len() as u64,
+            None,
+            Some(&token),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(CodecError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_stream_uncancelled_token_completes_normally() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let data = b"hello";
+        let result = write_stream(
+            &mut Cursor::new(data),
+            &mut tokio::io::sink(),
+            None,
+            data.len() as u64,
+            None,
+            Some(&token),
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
     async fn multi_chunk_has_more_flags() {
         let data: Vec<u8> = (0u8..255).cycle().take(CHUNK_SIZE * 2 + 512).collect();
         let mut wire = Vec::new();
-        write_stream(&mut Cursor::new(&data), &mut wire, None, 0, None)
+        write_stream(&mut Cursor::new(&data), &mut wire, None, 0, None, None)
             .await
             .unwrap();
 

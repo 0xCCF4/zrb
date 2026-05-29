@@ -1,16 +1,19 @@
 use std::collections::HashMap;
 use std::future::Future;
 
+type CancelMap = HashMap<String, tokio_util::sync::CancellationToken>;
+
 use anyhow::Context;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use sd_notify::NotifyState;
 use tokio::io::{AsyncBufRead, AsyncWrite};
+use tokio::sync::mpsc::Sender;
 use tokio::task::JoinSet;
 
 use crate::config::{RemoteConfig, RemoteTargets, SourceConfig};
 use crate::ops::{list as ops_list, snapshot as ops_snapshot};
-use crate::protocol::codec::{self, ClientHello, ClientReady};
+use crate::protocol::codec::{self, ClientHello, ClientReady, CodecError};
 use crate::ssh::transport;
+use crate::tui::SendEvent;
 use crate::zfs::{client as zfs, estimator};
 
 /// Back up `datasets` to all configured Remotes (or a named subset).
@@ -27,6 +30,8 @@ pub async fn send(
     remote_filter: Option<&[&str]>,
     config: &SourceConfig,
     sequential: bool,
+    event_tx: Option<Sender<SendEvent>>,
+    cancel_map: Option<CancelMap>,
 ) -> anyhow::Result<()> {
     for &dataset in datasets {
         let latest = ops_snapshot::snapshot(dataset, config)
@@ -50,8 +55,13 @@ pub async fn send(
             tasks,
             sequential,
             false,
+            event_tx.clone(),
+            cancel_map.as_ref(),
         )
         .await;
+    }
+    if let Some(ref tx) = event_tx {
+        let _ = tx.send(SendEvent::AllDone).await;
     }
     Ok(())
 }
@@ -71,6 +81,8 @@ pub async fn send_resume(
     remote_filter: Option<&[&str]>,
     config: &SourceConfig,
     sequential: bool,
+    event_tx: Option<Sender<SendEvent>>,
+    cancel_map: Option<CancelMap>,
 ) -> anyhow::Result<()> {
     for &dataset in datasets {
         let local_snaps = ops_list::list(dataset)
@@ -98,8 +110,13 @@ pub async fn send_resume(
             tasks,
             sequential,
             true,
+            event_tx.clone(),
+            cancel_map.as_ref(),
         )
         .await;
+    }
+    if let Some(ref tx) = event_tx {
+        let _ = tx.send(SendEvent::AllDone).await;
     }
     Ok(())
 }
@@ -129,6 +146,7 @@ fn collect_tasks(
     Ok(tasks)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_tasks(
     latest: &str,
     local_snaps: &[String],
@@ -137,50 +155,59 @@ async fn dispatch_tasks(
     tasks: Vec<(String, RemoteConfig, String)>,
     sequential: bool,
     is_resume: bool,
+    event_tx: Option<Sender<SendEvent>>,
+    cancel_map: Option<&CancelMap>,
 ) {
-    let mp = MultiProgress::new();
-    let max_name_len = tasks.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
-    let bars: Vec<ProgressBar> = tasks
-        .iter()
-        .map(|(name, _, _)| {
-            let bar = mp.add(ProgressBar::new(0));
-            bar.set_style(style_waiting());
-            bar.set_prefix(format!("{name:<max_name_len$}"));
-            bar
-        })
-        .collect();
-
     if sequential {
-        for ((remote_name, remote_cfg, target), bar) in tasks.iter().zip(bars) {
+        for (remote_name, remote_cfg, target) in &tasks {
+            let cancel = cancel_map.and_then(|m| m.get(remote_name)).cloned();
             let result = if is_resume {
-                resume_to_remote(latest, local_snaps, remote_cfg, target, client_name, bar).await
+                resume_to_remote(
+                    latest, local_snaps, remote_name, remote_cfg, target, client_name,
+                    event_tx.clone(), cancel,
+                )
+                .await
             } else {
-                send_to_remote(latest, local_snaps, remote_cfg, target, client_name, bar).await
+                send_to_remote(
+                    latest, local_snaps, remote_name, remote_cfg, target, client_name,
+                    event_tx.clone(), cancel,
+                )
+                .await
             };
-            if let Err(e) = result {
+            if let Err(e) = result && !is_cancelled(&e) {
                 let verb = if is_resume { "resume" } else { "send" };
                 log::warn!("{verb} {dataset} -> {remote_name}: {e:#}");
             }
         }
     } else {
         let mut set: JoinSet<(String, anyhow::Result<()>)> = JoinSet::new();
-        for ((remote_name, remote_cfg, target), bar) in tasks.into_iter().zip(bars) {
+        for (remote_name, remote_cfg, target) in tasks {
             let (latest, local_snaps, cname) = (
                 latest.to_owned(),
                 local_snaps.to_vec(),
                 client_name.to_owned(),
             );
+            let tx = event_tx.clone();
+            let cancel = cancel_map.and_then(|m| m.get(&remote_name)).cloned();
             set.spawn(async move {
                 let result = if is_resume {
-                    resume_to_remote(&latest, &local_snaps, &remote_cfg, &target, &cname, bar).await
+                    resume_to_remote(
+                        &latest, &local_snaps, &remote_name, &remote_cfg, &target, &cname,
+                        tx, cancel,
+                    )
+                    .await
                 } else {
-                    send_to_remote(&latest, &local_snaps, &remote_cfg, &target, &cname, bar).await
+                    send_to_remote(
+                        &latest, &local_snaps, &remote_name, &remote_cfg, &target, &cname,
+                        tx, cancel,
+                    )
+                    .await
                 };
                 (remote_name, result)
             });
         }
         while let Some(joined) = set.join_next().await {
-            if let Ok((rname, Err(e))) = joined {
+            if let Ok((rname, Err(e))) = joined && !is_cancelled(&e) {
                 let verb = if is_resume { "resume" } else { "send" };
                 log::warn!("{verb} {dataset} -> {rname}: {e:#}");
             }
@@ -188,43 +215,16 @@ async fn dispatch_tasks(
     }
 }
 
-fn style_waiting() -> ProgressStyle {
-    ProgressStyle::with_template("  {prefix:.dim}  waiting").expect("static template is valid")
-}
-
-fn style_active_bounded() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "  {prefix:.cyan.bold}  [{bar:40.cyan/white}] \
-         {decimal_bytes}/{decimal_total_bytes}  {decimal_bytes_per_sec}  ETA {eta}",
-    )
-    .expect("static template is valid")
-    .progress_chars("=>-")
-}
-
-fn style_active_unbounded() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "  {prefix:.cyan.bold}  {spinner}  {decimal_bytes}  {decimal_bytes_per_sec}",
-    )
-    .expect("static template is valid")
-}
-
-fn style_done() -> ProgressStyle {
-    ProgressStyle::with_template("  {prefix:.green.bold}  {decimal_bytes} {msg}")
-        .expect("static template is valid")
-}
-
-fn style_failed() -> ProgressStyle {
-    ProgressStyle::with_template("  {prefix:.red.bold}  failed").expect("static template is valid")
-}
-
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
 async fn send_to_remote(
     latest: &str,
     local_snaps: &[String],
+    remote_name: &str,
     remote_cfg: &RemoteConfig,
     target: &str,
     client_name: &str,
-    bar: ProgressBar,
+    event_tx: Option<Sender<SendEvent>>,
+    cancel: Option<tokio_util::sync::CancellationToken>,
 ) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let dataset = latest.split_once('@').map_or(latest, |(d, _)| d);
@@ -232,69 +232,84 @@ async fn send_to_remote(
     let mut conn = transport::connect(remote_cfg, &[])?;
     let mut reader = tokio::io::BufReader::new(conn.stdout);
 
-    let mut final_bytes = 0u64;
-    let mut style_set = false;
-    let result = {
-        let fb = &mut final_bytes;
-        let ss = &mut style_set;
-        let bar_cb = bar.clone();
-        let cb: &mut (dyn FnMut(u64, u64) + Send) = &mut move |bytes: u64, total: u64| {
-            *fb = bytes;
-            let _ = sd_notify::notify(&[NotifyState::Watchdog]);
-            if !*ss {
-                if total > 0 {
-                    bar_cb.set_length(total);
-                    bar_cb.set_style(style_active_bounded());
-                } else {
-                    bar_cb.set_style(style_active_unbounded());
-                }
-                *ss = true;
-            }
-            bar_cb.set_position(bytes);
-        };
-        send_on(
-            latest,
-            local_snaps,
-            remote_cfg,
-            target,
-            client_name,
-            &mut reader,
-            &mut conn.stdin,
-            Some(cb),
-        )
-        .await
-    };
+    let result = send_on(
+        latest,
+        local_snaps,
+        remote_cfg,
+        target,
+        client_name,
+        &mut reader,
+        &mut conn.stdin,
+        remote_name,
+        event_tx.clone(),
+        cancel.as_ref(),
+    )
+    .await;
 
     drop(conn.stdin);
     let _ = conn.child.wait().await;
 
     let elapsed_s = start.elapsed().as_secs_f64();
-    let rate_mbs = if elapsed_s > 0.0 {
-        final_bytes as f64 / 1_000_000.0 / elapsed_s
-    } else {
-        0.0
-    };
-    if result.is_ok() {
-        bar.set_style(style_done());
-        bar.set_position(final_bytes);
-        bar.finish_with_message(format!("({elapsed_s:.1}s)"));
-        log::info!("sent {dataset}: {final_bytes} bytes in {elapsed_s:.1}s ({rate_mbs:.2} MB/s)");
-    } else {
-        bar.set_style(style_failed());
-        bar.abandon();
+    match result {
+        Ok(bytes) => {
+            #[allow(clippy::cast_precision_loss)]
+            let rate_mbs = if elapsed_s > 0.0 {
+                bytes as f64 / 1_000_000.0 / elapsed_s
+            } else {
+                0.0
+            };
+            log::info!(
+                "sent {dataset}: {bytes} bytes in {elapsed_s:.1}s ({rate_mbs:.2} MB/s)"
+            );
+            if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(SendEvent::RemoteCompleted {
+                        remote: remote_name.to_owned(),
+                        elapsed_secs: elapsed_s,
+                        bytes,
+                    })
+                    .await;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if is_cancelled(&e) {
+                log::debug!("send {dataset} -> {remote_name}: cancelled by user");
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(SendEvent::RemoteSkipped {
+                            remote: remote_name.to_owned(),
+                        })
+                        .await;
+                }
+            } else if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(SendEvent::RemoteFailed {
+                        remote: remote_name.to_owned(),
+                        error: e.to_string(),
+                    })
+                    .await;
+            }
+            Err(e)
+        }
     }
-
-    result
 }
 
-#[allow(clippy::cast_precision_loss)]
+fn is_cancelled(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<CodecError>()
+        .is_some_and(|c| matches!(c, CodecError::Cancelled))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn resume_to_remote(
     latest: &str,
     local_snaps: &[String],
+    remote_name: &str,
     remote_cfg: &RemoteConfig,
     target: &str,
     client_name: &str,
-    bar: ProgressBar,
+    event_tx: Option<Sender<SendEvent>>,
+    cancel: Option<tokio_util::sync::CancellationToken>,
 ) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let dataset = latest.split_once('@').map_or(latest, |(d, _)| d);
@@ -302,70 +317,77 @@ async fn resume_to_remote(
     let mut conn = transport::connect(remote_cfg, &[])?;
     let mut reader = tokio::io::BufReader::new(conn.stdout);
 
-    let mut final_bytes = 0u64;
-    let mut style_set = false;
-    let result = {
-        let fb = &mut final_bytes;
-        let ss = &mut style_set;
-        let bar_cb = bar.clone();
-        let cb: &mut (dyn FnMut(u64, u64) + Send) = &mut move |bytes: u64, total: u64| {
-            *fb = bytes;
-            let _ = sd_notify::notify(&[NotifyState::Watchdog]);
-            if !*ss {
-                if total > 0 {
-                    bar_cb.set_length(total);
-                    bar_cb.set_style(style_active_bounded());
-                } else {
-                    bar_cb.set_style(style_active_unbounded());
-                }
-                *ss = true;
-            }
-            bar_cb.set_position(bytes);
-        };
-        resume_on(
-            latest,
-            local_snaps,
-            remote_cfg,
-            target,
-            client_name,
-            &mut reader,
-            &mut conn.stdin,
-            Some(cb),
-        )
-        .await
-    };
+    let result = resume_on(
+        latest,
+        local_snaps,
+        remote_cfg,
+        target,
+        client_name,
+        &mut reader,
+        &mut conn.stdin,
+        remote_name,
+        event_tx.clone(),
+        cancel.as_ref(),
+    )
+    .await;
 
     drop(conn.stdin);
     let _ = conn.child.wait().await;
 
     let elapsed_s = start.elapsed().as_secs_f64();
-    let rate_mbs = if elapsed_s > 0.0 {
-        final_bytes as f64 / 1_000_000.0 / elapsed_s
-    } else {
-        0.0
-    };
-    if result.is_ok() {
-        bar.set_style(style_done());
-        bar.set_position(final_bytes);
-        bar.finish_with_message(format!("({elapsed_s:.1}s)"));
-        log::info!(
-            "resumed {dataset}: {final_bytes} bytes in {elapsed_s:.1}s ({rate_mbs:.2} MB/s)"
-        );
-    } else {
-        bar.set_style(style_failed());
-        bar.abandon();
+    match result {
+        Ok(bytes) => {
+            #[allow(clippy::cast_precision_loss)]
+            let rate_mbs = if elapsed_s > 0.0 {
+                bytes as f64 / 1_000_000.0 / elapsed_s
+            } else {
+                0.0
+            };
+            log::info!(
+                "resumed {dataset}: {bytes} bytes in {elapsed_s:.1}s ({rate_mbs:.2} MB/s)"
+            );
+            if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(SendEvent::RemoteCompleted {
+                        remote: remote_name.to_owned(),
+                        elapsed_secs: elapsed_s,
+                        bytes,
+                    })
+                    .await;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if is_cancelled(&e) {
+                log::debug!("resume {dataset} -> {remote_name}: cancelled by user");
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(SendEvent::RemoteSkipped {
+                            remote: remote_name.to_owned(),
+                        })
+                        .await;
+                }
+            } else if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(SendEvent::RemoteFailed {
+                        remote: remote_name.to_owned(),
+                        error: e.to_string(),
+                    })
+                    .await;
+            }
+            Err(e)
+        }
     }
-
-    result
 }
 
 /// Run the send protocol over arbitrary async `Read`/`Write` streams.
 ///
 /// Encodes `ClientHello`, reads `ServerHello`, streams the ZFS send output,
-/// then reads `ServerStatus` and returns `Ok` or an error.
+/// then reads `ServerStatus` and returns `Ok(bytes_sent)` or an error.
 ///
-/// `progress`, if `Some`, is called after each protocol chunk with
-/// `(bytes_so_far, total_bytes)`. `total_bytes = 0` means unknown (resume path).
+/// `RemoteStarted` is emitted on `event_tx` (if `Some`) right before the
+/// stream starts, carrying the estimated total bytes. `RemoteProgress` is
+/// emitted after each protocol chunk.
 ///
 /// # Errors
 /// Returns `Err` on I/O, codec, or remote protocol failure.
@@ -378,8 +400,10 @@ pub async fn send_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     client_name: &str,
     reader: &mut R,
     writer: &mut W,
-    progress: Option<&mut (dyn FnMut(u64, u64) + Send)>,
-) -> anyhow::Result<()> {
+    remote_name: &str,
+    event_tx: Option<Sender<SendEvent>>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> anyhow::Result<u64> {
     codec::encode_client_hello(
         &ClientHello {
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -404,9 +428,6 @@ pub async fn send_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
 
     log::debug!("server has {} snapshot(s)", hello.snapshots.len());
 
-    // Server snapshots use the destination dataset prefix; local snapshots use
-    // the source dataset prefix.  Compare only the @name suffix (timestamp) so
-    // that snapshots which exist on both sides are recognised as common.
     let stream_res = if let Some(ref token) = hello.resume_token {
         log::debug!("resume token present; using zfs send -t");
         let size = estimate_resume_size(token, &remote_cfg.zfs_send_opts).await;
@@ -479,22 +500,48 @@ pub async fn send_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         }
     };
 
-    codec::write_stream(
-        &mut zfs_out,
-        writer,
-        remote_cfg.bandwidth_limit,
-        total_bytes,
-        progress,
-    )
-    .await
-    .context("transferring stream")?;
+    if let Some(ref tx) = event_tx {
+        let _ = tx
+            .send(SendEvent::RemoteStarted {
+                remote: remote_name.to_owned(),
+                total_bytes,
+            })
+            .await;
+    }
+
+    let mut bytes_sent: u64 = 0;
+    {
+        let bs = &mut bytes_sent;
+        let rn = remote_name.to_owned();
+        let etx = event_tx;
+        let cb: &mut (dyn FnMut(u64, u64) + Send) = &mut move |b: u64, _total: u64| {
+            *bs = b;
+            let _ = sd_notify::notify(&[NotifyState::Watchdog]);
+            if let Some(ref tx) = etx {
+                let _ = tx.try_send(SendEvent::RemoteProgress {
+                    remote: rn.clone(),
+                    bytes_sent: b,
+                });
+            }
+        };
+        codec::write_stream(
+            &mut zfs_out,
+            writer,
+            remote_cfg.bandwidth_limit,
+            total_bytes,
+            Some(cb),
+            cancel,
+        )
+        .await
+        .context("transferring stream")?;
+    }
 
     let status = codec::decode_server_status(reader)
         .await
         .context("reading ServerStatus")?;
 
     if status.ok {
-        Ok(())
+        Ok(bytes_sent)
     } else {
         Err(remote_receive_error(&status.message))
     }
@@ -520,8 +567,10 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     client_name: &str,
     reader: &mut R,
     writer: &mut W,
-    progress: Option<&mut (dyn FnMut(u64, u64) + Send)>,
-) -> anyhow::Result<()> {
+    remote_name: &str,
+    event_tx: Option<Sender<SendEvent>>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> anyhow::Result<u64> {
     codec::encode_client_hello(
         &ClientHello {
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -629,22 +678,48 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         }
     };
 
-    codec::write_stream(
-        &mut zfs_out,
-        writer,
-        remote_cfg.bandwidth_limit,
-        total_bytes,
-        progress,
-    )
-    .await
-    .context("transferring stream")?;
+    if let Some(ref tx) = event_tx {
+        let _ = tx
+            .send(SendEvent::RemoteStarted {
+                remote: remote_name.to_owned(),
+                total_bytes,
+            })
+            .await;
+    }
+
+    let mut bytes_sent: u64 = 0;
+    {
+        let bs = &mut bytes_sent;
+        let rn = remote_name.to_owned();
+        let etx = event_tx;
+        let cb: &mut (dyn FnMut(u64, u64) + Send) = &mut move |b: u64, _total: u64| {
+            *bs = b;
+            let _ = sd_notify::notify(&[NotifyState::Watchdog]);
+            if let Some(ref tx) = etx {
+                let _ = tx.try_send(SendEvent::RemoteProgress {
+                    remote: rn.clone(),
+                    bytes_sent: b,
+                });
+            }
+        };
+        codec::write_stream(
+            &mut zfs_out,
+            writer,
+            remote_cfg.bandwidth_limit,
+            total_bytes,
+            Some(cb),
+            cancel,
+        )
+        .await
+        .context("transferring stream")?;
+    }
 
     let status = codec::decode_server_status(reader)
         .await
         .context("reading ServerStatus")?;
 
     if status.ok {
-        Ok(())
+        Ok(bytes_sent)
     } else {
         Err(remote_receive_error(&status.message))
     }
@@ -670,7 +745,6 @@ async fn estimate_resume_size(token: &str, opts: &[String]) -> u64 {
     else {
         return 0;
     };
-    // ZFS writes verbose stats to stderr; combine with stdout for compatibility
     let combined = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stderr),
@@ -763,6 +837,8 @@ mod tests {
             "my-laptop",
             &mut tokio::io::BufReader::new(Cursor::new(reader_bytes)),
             &mut tokio::io::sink(),
+            "primary",
+            None,
             None,
         )
         .await;
@@ -798,6 +874,8 @@ mod tests {
             "my-laptop",
             &mut tokio::io::BufReader::new(Cursor::new(version_ok_then_hello(&hello).await)),
             &mut tokio::io::sink(),
+            "primary",
+            None,
             None,
         )
         .await;
@@ -831,11 +909,12 @@ mod tests {
             "my-laptop",
             &mut tokio::io::BufReader::new(Cursor::new(reader_bytes)),
             &mut writer,
+            "primary",
+            None,
             None,
         )
         .await;
 
-        // writer has ClientHello then ClientReady — skip past ClientHello
         let mut r = tokio::io::BufReader::new(Cursor::new(&writer));
         let _: codec::ClientHello = codec::decode_client_hello(&mut r).await.unwrap();
         let ready = codec::decode_client_ready(&mut r).await.unwrap();
@@ -878,6 +957,8 @@ mod tests {
             "my-laptop",
             &mut tokio::io::BufReader::new(Cursor::new(server_bytes)),
             &mut tokio::io::sink(),
+            "primary",
+            None,
             None,
         )
         .await;
@@ -902,6 +983,8 @@ mod tests {
             "my-laptop",
             &mut tokio::io::BufReader::new(Cursor::new(server_bytes)),
             &mut tokio::io::sink(),
+            "primary",
+            None,
             None,
         )
         .await;
@@ -1054,13 +1137,12 @@ mod tests {
             "my-laptop",
             &mut tokio::io::BufReader::new(Cursor::new(reader_bytes)),
             &mut tokio::io::sink(),
+            "primary",
+            None,
             None,
         )
         .await;
 
-        // With a fake token, zfs::send_resume will either fail to spawn
-        // (ZFS unavailable) or produce an error stream (invalid token).
-        // Either way resume_on must return Err, never panic.
         assert!(
             result.is_err(),
             "expected Err with fake resume token, got Ok"
@@ -1084,6 +1166,8 @@ mod tests {
             "my-laptop",
             &mut tokio::io::BufReader::new(Cursor::new(reader_bytes)),
             &mut tokio::io::sink(),
+            "primary",
+            None,
             None,
         )
         .await;
@@ -1091,6 +1175,66 @@ mod tests {
         assert!(
             result.is_err(),
             "expected Err with fake resume token, got Ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_on_emits_no_events_on_version_rejection() {
+        let latest = "tank/home@zrb-2026-01-20T00:00:00Z";
+        let local_snaps = vec![latest.to_owned()];
+        let server_bytes =
+            version_rejection_bytes("version mismatch: client 0.1.0, server 0.2.0").await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+
+        let _ = send_on(
+            latest,
+            &local_snaps,
+            &test_remote_cfg(),
+            "backup/home",
+            "my-laptop",
+            &mut tokio::io::BufReader::new(Cursor::new(server_bytes)),
+            &mut tokio::io::sink(),
+            "primary",
+            Some(tx),
+            None,
+        )
+        .await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "version rejection should emit no events — RemoteStarted only fires when ZFS stream starts"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_on_emits_no_events_before_stream_starts() {
+        let latest = "tank/home@zrb-2026-01-20T00:00:00Z";
+        let local_snaps = vec![latest.to_owned()];
+        let hello = crate::protocol::codec::ServerHello {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            snapshots: vec!["backup/home@zrb-2026-01-20T00:00:00Z".to_owned()],
+            resume_token: None,
+        };
+        let reader_bytes = version_ok_then_hello(&hello).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+
+        let _ = resume_on(
+            latest,
+            &local_snaps,
+            &test_remote_cfg(),
+            "backup/home",
+            "my-laptop",
+            &mut tokio::io::BufReader::new(Cursor::new(reader_bytes)),
+            &mut tokio::io::sink(),
+            "primary",
+            Some(tx),
+            None,
+        )
+        .await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "already-on-server error should emit no events before stream starts"
         );
     }
 }

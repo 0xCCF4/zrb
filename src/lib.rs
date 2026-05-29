@@ -4,4 +4,5 @@ pub mod protocol;
 pub mod retention;
 pub mod snapshot;
 pub mod ssh;
+pub mod tui;
 pub mod zfs;

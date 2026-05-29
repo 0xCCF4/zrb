@@ -67,6 +67,10 @@ enum Commands {
         /// Send to each Remote one at a time instead of in parallel.
         #[arg(long)]
         sequential: bool,
+
+        /// Activate the full-screen TUI (requires a controlling TTY).
+        #[arg(long)]
+        tui: bool,
     },
 
     /// Prune zrb-managed snapshots according to the Retention Policy.
@@ -218,6 +222,7 @@ async fn run() -> anyhow::Result<()> {
             remotes,
             resume,
             sequential,
+            tui,
         } => {
             for ds in &datasets {
                 validate_dataset(ds)?;
@@ -231,11 +236,85 @@ async fn run() -> anyhow::Result<()> {
             } else {
                 Some(remotes.iter().map(String::as_str).collect())
             };
-            if resume {
-                ops::send::send_resume(&ds_refs, filter.as_deref(), &cfg, sequential).await?;
+
+            // Safety: `isatty` is always safe to call with a valid fd.
+            let maybe_tui = if tui {
+                if unsafe { libc::isatty(libc::STDOUT_FILENO) } == 0 {
+                    anyhow::bail!(
+                        "--tui requires a controlling TTY; \
+                         stdout is not a terminal (piped or redirected)"
+                    );
+                }
+
+                // Build the dataset → remote-name display list for the countdown screen.
+                let display_info: Vec<(String, Vec<String>)> = ds_refs
+                    .iter()
+                    .map(|&ds| {
+                        let mut remote_names: Vec<String> = cfg
+                            .datasets
+                            .get(ds)
+                            .into_iter()
+                            .flat_map(|rt| {
+                                rt.keys().filter(|n| {
+                                    filter.as_deref().is_none_or(|f| f.contains(&n.as_str()))
+                                })
+                            })
+                            .cloned()
+                            .collect();
+                        remote_names.sort_unstable();
+                        (ds.to_owned(), remote_names)
+                    })
+                    .collect();
+
+                let proceed = zrb::tui::run_countdown(&display_info).await?;
+                if !proceed {
+                    return Ok(());
+                }
+
+                let mut remote_names: Vec<String> = display_info
+                    .iter()
+                    .flat_map(|(_, remotes)| remotes.iter().cloned())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                remote_names.sort_unstable();
+
+                let cancel_map = zrb::tui::build_cancel_map(&remote_names);
+                let cancel_for_send: std::collections::HashMap<_, _> = cancel_map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+
+                let (tx, rx) = tokio::sync::mpsc::channel(256);
+                let tui_task =
+                    tokio::spawn(zrb::tui::run_transfer(rx, remote_names, cancel_map));
+
+                Some((tx, tui_task, cancel_for_send))
             } else {
-                ops::send::send(&ds_refs, filter.as_deref(), &cfg, sequential).await?;
+                None
+            };
+
+            let (event_tx, tui_task, cancel_map) = match maybe_tui {
+                Some((tx, task, cancel)) => (Some(tx), Some(task), Some(cancel)),
+                None => (None, None, None),
+            };
+
+            if resume {
+                ops::send::send_resume(
+                    &ds_refs, filter.as_deref(), &cfg, sequential, event_tx, cancel_map,
+                )
+                .await?;
+            } else {
+                ops::send::send(
+                    &ds_refs, filter.as_deref(), &cfg, sequential, event_tx, cancel_map,
+                )
+                .await?;
             }
+
+            if let Some(task) = tui_task {
+                task.await??;
+            }
+
             let _ = sd_notify::notify(&[NotifyState::Stopping]);
         }
 
@@ -399,6 +478,59 @@ mod tests {
     #[test]
     fn completions_elvish_non_empty() {
         assert!(!generate(clap_complete::Shell::Elvish).is_empty());
+    }
+
+    #[test]
+    fn send_tui_flag_parses() {
+        let cli = Cli::try_parse_from(["zrb", "send", "--tui", "tank/home"]);
+        assert!(cli.is_ok(), "zrb send --tui <dataset> should parse");
+        if let Ok(Cli {
+            command: Commands::Send { tui, .. },
+            ..
+        }) = cli
+        {
+            assert!(tui, "--tui should be true");
+        }
+    }
+
+    #[test]
+    fn send_tui_flag_absent_defaults_false() {
+        let cli = Cli::try_parse_from(["zrb", "send", "tank/home"]).unwrap();
+        if let Commands::Send { tui, .. } = cli.command {
+            assert!(!tui, "--tui should default to false");
+        }
+    }
+
+    #[test]
+    fn send_tui_flag_absent_from_prune() {
+        let cli = Cli::try_parse_from(["zrb", "prune", "tank/home", "--tui"]);
+        assert!(cli.is_err(), "--tui must not exist on the prune subcommand");
+    }
+
+    #[test]
+    fn send_event_variants_accessible() {
+        use zrb::tui::SendEvent;
+        let _ = SendEvent::AllDone;
+        let _ = SendEvent::RemoteStarted {
+            remote: "r".into(),
+            total_bytes: 0,
+        };
+        let _ = SendEvent::RemoteProgress {
+            remote: "r".into(),
+            bytes_sent: 0,
+        };
+        let _ = SendEvent::RemoteCompleted {
+            remote: "r".into(),
+            elapsed_secs: 0.0,
+            bytes: 0,
+        };
+        let _ = SendEvent::RemoteFailed {
+            remote: "r".into(),
+            error: "e".into(),
+        };
+        let _ = SendEvent::RemoteSkipped { remote: "r".into() };
+        let _ = SendEvent::CountdownTick { remaining_secs: 5 };
+        let _ = SendEvent::CountdownAborted;
     }
 
     #[test]
