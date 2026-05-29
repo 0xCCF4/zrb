@@ -75,20 +75,11 @@ enum Commands {
 
     /// Prune zrb-managed snapshots according to the Retention Policy.
     Prune {
-        /// Dataset to prune (mutually exclusive with --all).
-        #[arg(conflicts_with = "all", required_unless_present = "all")]
-        dataset: Option<String>,
-
-        /// Prune all datasets that have zrb-managed snapshots.
-        #[arg(long, conflicts_with = "dataset", conflicts_with = "recursive")]
-        all: bool,
-
-        /// Also prune child datasets. Requires DATASET.
-        #[arg(long, short = 'r', conflicts_with = "all", requires = "dataset")]
-        recursive: bool,
+        /// Datasets to prune. Omit to read the list from the config file.
+        datasets: Vec<String>,
 
         /// Preview what would be pruned without deleting anything.
-        #[arg(long)]
+        #[arg(long, short='n')]
         dry_run: bool,
 
         /// Abort any in-progress resume transfer and prune anyway.
@@ -319,69 +310,52 @@ async fn run() -> anyhow::Result<()> {
         }
 
         Commands::Prune {
-            dataset,
-            all,
-            recursive,
+            datasets,
             dry_run,
             abort_resume,
         } => {
-            if let Some(ds) = &dataset {
+            for ds in &datasets {
                 validate_dataset(ds)?;
             }
             let cfg_path = cli.config.unwrap_or_else(default_source_config);
             // Server config takes priority: the remote runs `zrb prune` with
             // `--config server.toml`, which has `resume_hold_days`.
-            let (retention, hold_days) = config::load_server(&cfg_path)
+            let (retention, hold_days, config_datasets) = config::load_server(&cfg_path)
                 .map(|c| {
                     let days = c.resume_hold_days();
-                    (c.retention, Some(days))
+                    let ds = c.prune_datasets();
+                    (c.retention, Some(days), ds)
                 })
-                .or_else(|_| config::load_source(&cfg_path).map(|c| (c.retention, None)))?;
-            if all {
-                let results = ops::prune::prune_all(&retention, hold_days, dry_run, abort_resume)?;
-                if dry_run {
-                    print_prune_dry_run(&results);
-                } else {
-                    for (ds, result) in &results {
-                        log::info!(
-                            "pruned {}: kept {}, deleted {}",
-                            ds,
-                            result.kept.len(),
-                            result.deleted.len()
-                        );
-                        for s in &result.deleted {
-                            log::debug!("deleted {s}");
-                        }
-                    }
-                }
+                .or_else(|_| {
+                    config::load_source(&cfg_path)
+                        .map(|c| {
+                            let ds = c.prune_datasets();
+                            (c.retention, None, ds)
+                        })
+                })?;
+            let targets = if datasets.is_empty() {
+                config_datasets
             } else {
-                let dataset = dataset.expect("required_unless_present = all");
-                let results = if recursive {
-                    ops::prune::prune_recursive(
-                        &dataset,
-                        &retention,
-                        hold_days,
-                        dry_run,
-                        abort_resume,
-                    )?
-                } else {
-                    let result =
-                        ops::prune::prune(&dataset, &retention, hold_days, dry_run, abort_resume)?;
-                    vec![(dataset, result)]
-                };
-                if dry_run {
-                    print_prune_dry_run(&results);
-                } else {
-                    for (ds, result) in &results {
-                        log::info!(
-                            "pruned {}: kept {}, deleted {}",
-                            ds,
-                            result.kept.len(),
-                            result.deleted.len()
-                        );
-                        for s in &result.deleted {
-                            log::debug!("deleted {s}");
-                        }
+                datasets
+            };
+            let mut results: Vec<(String, ops::prune::PruneResult)> = Vec::new();
+            for ds in targets {
+                let result =
+                    ops::prune::prune(&ds, &retention, hold_days, dry_run, abort_resume)?;
+                results.push((ds, result));
+            }
+            if dry_run {
+                print_prune_dry_run(&results);
+            } else {
+                for (ds, result) in &results {
+                    log::info!(
+                        "pruned {}: kept {}, deleted {}",
+                        ds,
+                        result.kept.len(),
+                        result.deleted.len()
+                    );
+                    for s in &result.deleted {
+                        log::debug!("deleted {s}");
                     }
                 }
             }
@@ -576,34 +550,44 @@ mod tests {
     }
 
     #[test]
-    fn prune_all_flag_parses() {
-        let cli = Cli::try_parse_from(["zrb", "prune", "--all"]);
-        assert!(cli.is_ok(), "zrb prune --all should parse successfully");
-    }
-
-    #[test]
-    fn prune_dataset_alone_parses() {
-        let cli = Cli::try_parse_from(["zrb", "prune", "tank/home"]);
-        assert!(
-            cli.is_ok(),
-            "zrb prune <dataset> should still parse successfully"
-        );
-    }
-
-    #[test]
-    fn prune_no_args_errors() {
+    fn prune_no_args_parses() {
         let cli = Cli::try_parse_from(["zrb", "prune"]);
-        assert!(cli.is_err(), "zrb prune with no args should be a CLI error");
+        assert!(cli.is_ok(), "zrb prune with no args should parse (auto-from-config)");
+        if let Ok(Cli { command: Commands::Prune { datasets, .. }, .. }) = cli {
+            assert!(datasets.is_empty());
+        }
     }
 
     #[test]
-    fn prune_dataset_and_all_conflict() {
-        let cli = Cli::try_parse_from(["zrb", "prune", "tank/home", "--all"]);
-        assert!(
-            cli.is_err(),
-            "zrb prune <dataset> --all should be a CLI error"
-        );
+    fn prune_single_dataset_parses() {
+        let cli = Cli::try_parse_from(["zrb", "prune", "tank/home"]);
+        assert!(cli.is_ok(), "zrb prune <dataset> should parse");
+        if let Ok(Cli { command: Commands::Prune { datasets, .. }, .. }) = cli {
+            assert_eq!(datasets, vec!["tank/home"]);
+        }
     }
+
+    #[test]
+    fn prune_multiple_datasets_parse() {
+        let cli = Cli::try_parse_from(["zrb", "prune", "tank/home", "tank/projects"]);
+        assert!(cli.is_ok(), "zrb prune <d1> <d2> should parse");
+        if let Ok(Cli { command: Commands::Prune { datasets, .. }, .. }) = cli {
+            assert_eq!(datasets, vec!["tank/home", "tank/projects"]);
+        }
+    }
+
+    #[test]
+    fn prune_all_flag_is_error() {
+        let cli = Cli::try_parse_from(["zrb", "prune", "--all"]);
+        assert!(cli.is_err(), "--all must not exist on the prune subcommand");
+    }
+
+    #[test]
+    fn prune_recursive_flag_is_error() {
+        let cli = Cli::try_parse_from(["zrb", "prune", "tank", "--recursive"]);
+        assert!(cli.is_err(), "--recursive must not exist on the prune subcommand");
+    }
+
 
     #[test]
     fn list_no_args_parses() {
@@ -654,47 +638,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prune_recursive_with_dataset_parses() {
-        let cli = Cli::try_parse_from(["zrb", "prune", "tank", "--recursive"]).unwrap();
-        if let Commands::Prune {
-            dataset,
-            recursive,
-            all,
-            ..
-        } = cli.command
-        {
-            assert_eq!(dataset.as_deref(), Some("tank"));
-            assert!(recursive);
-            assert!(!all);
-        }
-    }
-
-    #[test]
-    fn prune_recursive_short_flag_parses() {
-        let cli = Cli::try_parse_from(["zrb", "prune", "tank", "-r"]).unwrap();
-        if let Commands::Prune { recursive, .. } = cli.command {
-            assert!(recursive);
-        }
-    }
-
-    #[test]
-    fn prune_recursive_without_dataset_errors() {
-        let cli = Cli::try_parse_from(["zrb", "prune", "--recursive"]);
-        assert!(
-            cli.is_err(),
-            "zrb prune --recursive without a dataset should be a CLI error"
-        );
-    }
-
-    #[test]
-    fn prune_recursive_and_all_conflict() {
-        let cli = Cli::try_parse_from(["zrb", "prune", "--all", "--recursive"]);
-        assert!(
-            cli.is_err(),
-            "zrb prune --all --recursive should be a CLI error"
-        );
-    }
 
     #[test]
     fn validate_dataset_rejects_absolute_path() {
@@ -723,12 +666,6 @@ mod tests {
         {
             assert!(dry_run, "--dry-run should be true");
         }
-    }
-
-    #[test]
-    fn prune_dry_run_with_all_parses() {
-        let cli = Cli::try_parse_from(["zrb", "prune", "--all", "--dry-run"]);
-        assert!(cli.is_ok(), "zrb prune --all --dry-run should parse");
     }
 
     #[test]

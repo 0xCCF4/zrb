@@ -210,6 +210,21 @@ let
     }
   ];
 
+  serverPruneCfg = mkNixos [
+    nixosModules.server
+    {
+      services.zrb.server.backup = {
+        enable = true;
+        clients.myhost = {
+          allow = [ "pool/home" ];
+          publicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI testkey";
+        };
+        retention = { recent = 7; weeklyForDays = 30; monthlyForDays = 365; };
+        prune.onCalendar = "weekly";
+      };
+    }
+  ];
+
   # ── noxa fixtures ─────────────────────────────────────────────────────────
 
   # Server with noxa auto-population enabled; clients discovered from fakeNodesServer.
@@ -364,15 +379,56 @@ let
       (clientPruneCfg.systemd.services ? "zrb-prune")
       "zrb-prune service not generated when prune.onCalendar=\"weekly\"")
 
-    # Client: prune service ExecStart contains "prune --all"
+    # Client: prune service ExecStart contains "prune --config" (no --all)
     (lib.assertMsg
-      (lib.hasInfix "prune --all" clientPruneCfg.systemd.services."zrb-prune".serviceConfig.ExecStart)
-      "zrb-prune ExecStart does not contain \"prune --all\"")
+      (lib.hasInfix "prune --config" clientPruneCfg.systemd.services."zrb-prune".serviceConfig.ExecStart)
+      "zrb-prune ExecStart does not contain \"prune --config\"")
+    (lib.assertMsg
+      (!(lib.hasInfix "--all" clientPruneCfg.systemd.services."zrb-prune".serviceConfig.ExecStart))
+      "zrb-prune ExecStart must not contain --all")
 
     # Client: prune.onCalendar="weekly" produces prune timer
     (lib.assertMsg
       (clientPruneCfg.systemd.timers ? "zrb-prune")
       "zrb-prune timer not generated when prune.onCalendar=\"weekly\"")
+
+    # Server: prune.onCalendar=null (default) produces no prune service
+    (lib.assertMsg
+      (!(serverCfg.systemd.services ? "zrb-server-prune-backup"))
+      "zrb-server-prune-backup service must not exist when prune.onCalendar=null")
+
+    # Server: prune.onCalendar=null (default) produces no prune timer
+    (lib.assertMsg
+      (!(serverCfg.systemd.timers ? "zrb-server-prune-backup"))
+      "zrb-server-prune-backup timer must not exist when prune.onCalendar=null")
+
+    # Server: prune.onCalendar="weekly" produces prune service
+    (lib.assertMsg
+      (serverPruneCfg.systemd.services ? "zrb-server-prune-backup")
+      "zrb-server-prune-backup service not generated when prune.onCalendar=\"weekly\"")
+
+    # Server: prune service ExecStart contains "prune --config" (no --all)
+    (lib.assertMsg
+      (lib.hasInfix "prune --config" serverPruneCfg.systemd.services."zrb-server-prune-backup".serviceConfig.ExecStart)
+      "zrb-server-prune-backup ExecStart does not contain \"prune --config\"")
+    (lib.assertMsg
+      (!(lib.hasInfix "--all" serverPruneCfg.systemd.services."zrb-server-prune-backup".serviceConfig.ExecStart))
+      "zrb-server-prune-backup ExecStart must not contain --all")
+
+    # Server: prune.onCalendar="weekly" produces prune timer
+    (lib.assertMsg
+      (serverPruneCfg.systemd.timers ? "zrb-server-prune-backup")
+      "zrb-server-prune-backup timer not generated when prune.onCalendar=\"weekly\"")
+
+    # Server: prune timer has correct OnCalendar
+    (lib.assertMsg
+      (serverPruneCfg.systemd.timers."zrb-server-prune-backup".timerConfig.OnCalendar == "weekly")
+      "zrb-server-prune-backup timer OnCalendar is not \"weekly\"")
+
+    # Server: prune timer has Persistent=true
+    (lib.assertMsg
+      serverPruneCfg.systemd.timers."zrb-server-prune-backup".timerConfig.Persistent
+      "zrb-server-prune-backup timer Persistent is not true")
 
     # Server: client with publicKey=null produces no authorized_keys entry
     (lib.assertMsg

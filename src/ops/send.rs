@@ -524,7 +524,7 @@ pub async fn send_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 });
             }
         };
-        codec::write_stream(
+        if let Err(e) = codec::write_stream(
             &mut zfs_out,
             writer,
             remote_cfg.bandwidth_limit,
@@ -533,7 +533,15 @@ pub async fn send_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             cancel,
         )
         .await
-        .context("transferring stream")?;
+        {
+            if !matches!(e, codec::CodecError::Cancelled)
+                && let Ok(status) = codec::decode_server_status(reader).await
+                && !status.ok
+            {
+                return Err(remote_receive_error(&status.message));
+            }
+            return Err(e).context("transferring stream");
+        }
     }
 
     let status = codec::decode_server_status(reader)
@@ -702,7 +710,7 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 });
             }
         };
-        codec::write_stream(
+        if let Err(e) = codec::write_stream(
             &mut zfs_out,
             writer,
             remote_cfg.bandwidth_limit,
@@ -711,7 +719,15 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             cancel,
         )
         .await
-        .context("transferring stream")?;
+        {
+            if !matches!(e, codec::CodecError::Cancelled)
+                && let Ok(status) = codec::decode_server_status(reader).await
+                && !status.ok
+            {
+                return Err(remote_receive_error(&status.message));
+            }
+            return Err(e).context("transferring stream");
+        }
     }
 
     let status = codec::decode_server_status(reader)

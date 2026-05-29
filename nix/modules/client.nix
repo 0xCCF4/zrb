@@ -228,7 +228,7 @@ in
           serviceConfig = {
             Type = "oneshot";
             User = cfg.user;
-            ExecStart = "${cfg.package}/bin/zrb prune --all --config /etc/zrb/client.toml";
+            ExecStart = "${cfg.package}/bin/zrb prune --config /etc/zrb/client.toml";
           };
         };
       })

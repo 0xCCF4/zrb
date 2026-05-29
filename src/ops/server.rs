@@ -181,17 +181,12 @@ pub async fn run_server_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 .await?;
             }
         },
-        Err(e) => {
-            let _ = recv.finish().await;
+        Err(_) => {
+            let recv_err = recv.finish().await.err();
             annotate_resume_if_needed(&request.target)?;
-            codec::encode_server_status(
-                &ServerStatus {
-                    ok: false,
-                    message: e.to_string(),
-                },
-                output,
-            )
-            .await?;
+            let message = recv_err.map_or_else(|| "stream error".to_owned(), |e| e.to_string());
+            codec::encode_server_status(&ServerStatus { ok: false, message }, output)
+                .await?;
         }
     }
     Ok(())

@@ -118,6 +118,13 @@ impl SourceConfig {
     pub fn name(&self) -> &str {
         &self.source.name
     }
+
+    #[must_use]
+    pub fn prune_datasets(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.datasets.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -143,6 +150,18 @@ impl ServerConfig {
     #[must_use]
     pub fn resume_hold_days(&self) -> u32 {
         self.server.resume_hold_days
+    }
+
+    #[must_use]
+    pub fn prune_datasets(&self) -> Vec<String> {
+        let mut datasets: Vec<String> = self
+            .clients
+            .values()
+            .flat_map(|c| c.allow.iter().cloned())
+            .collect();
+        datasets.sort();
+        datasets.dedup();
+        datasets
     }
 }
 
@@ -209,6 +228,38 @@ recent = 14
 weekly_for_days = 60
 monthly_for_days = 730
 "#;
+
+    #[test]
+    fn server_prune_datasets_returns_sorted_deduped_union() {
+        let toml = r#"
+[server]
+resume_hold_days = 3
+
+[clients.laptop]
+allow = ["backup/laptop/home", "backup/laptop/docs"]
+
+[clients.desktop]
+allow = ["backup/desktop/home", "backup/laptop/docs"]
+
+[retention]
+recent = 5
+weekly_for_days = 30
+monthly_for_days = 365
+"#;
+        let cfg: ServerConfig = toml::from_str(toml).expect("should parse");
+        let datasets = cfg.prune_datasets();
+        assert_eq!(
+            datasets,
+            vec!["backup/desktop/home", "backup/laptop/docs", "backup/laptop/home"]
+        );
+    }
+
+    #[test]
+    fn source_prune_datasets_returns_sorted_keys() {
+        let cfg: SourceConfig = toml::from_str(SOURCE_TOML).expect("should parse");
+        let datasets = cfg.prune_datasets();
+        assert_eq!(datasets, vec!["tank/documents", "tank/home"]);
+    }
 
     #[test]
     fn source_config_deserializes_prd_example() {

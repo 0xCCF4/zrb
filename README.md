@@ -103,6 +103,17 @@ zfs allow -u <user> receive,create,destroy,mount backup/laptop
 
 Keep the delegation as narrow as possible — per-dataset subtree, not the whole pool.
 
+After the first backup run has created the target datasets, set `readonly=on` on the parent to prevent
+accidental filesystem writes by any process on the Remote:
+
+```sh
+zfs set readonly=on backup/laptop
+```
+
+This has no effect on `zfs receive` or snapshot pruning — those operate at the ZFS layer, not the
+filesystem layer, and are unaffected by the property. Only normal file writes through the mounted
+filesystem are blocked.
+
 **Do not create the target datasets manually.** `zrb` creates them automatically on the first transfer via
 `zfs receive`. Pre-existing datasets will cause `zfs receive` to fail.
 
