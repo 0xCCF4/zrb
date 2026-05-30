@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/0xCCF4/zrb/compare/v0.1.1...v0.2.0) - 2026-05-30
+
+### Fixed
+
+- hold lingers bug
+- tests break on version update
+- [**breaking**] hold most recent snapshot to prevent history divergence
+- prune
+- tokio runtime
+- tokio runtime
+
+### Other
+
+- tui
+- progress bars
+- [**breaking**] pretty prune and fix deadlock for resuming finished transfer
+- use tokio for sending to multiple hosts
+
 ## [0.1.1](https://github.com/0xCCF4/zrb/compare/v0.1.0...v0.1.1) - 2026-05-25
 
 ### Fixed
