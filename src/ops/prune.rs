@@ -10,6 +10,9 @@ pub struct PruneResult {
     pub deleted: Vec<String>,
     /// True when pruning was skipped because a resume transfer is in progress.
     pub resume_skipped: bool,
+    /// Snapshots skipped because they carry a Transfer Hold (`zrb:*`), as
+    /// `(snapshot_name, hold_tag)` pairs.
+    pub hold_skipped: Vec<(String, String)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -44,6 +47,17 @@ pub(crate) fn resume_decision(
     }
 }
 
+
+/// Return all `zrb:*`-prefixed tags from `holds` (the full tag string, not stripped).
+///
+/// Used to identify Transfer Holds before attempting to destroy a snapshot.
+pub(crate) fn zrb_holds_from_tags(holds: &[String]) -> Vec<String> {
+    holds
+        .iter()
+        .filter(|h| h.starts_with("zrb:"))
+        .cloned()
+        .collect()
+}
 
 /// Apply the Retention Policy to `dataset` and destroy out-of-policy snapshots.
 ///
@@ -86,6 +100,7 @@ pub fn prune(
                 kept: vec![],
                 deleted: vec![],
                 resume_skipped: true,
+                hold_skipped: vec![],
             });
         }
         ResumeDecision::Expire => {
@@ -97,16 +112,36 @@ pub fn prune(
     }
 
     let snapshots = ops_list::list(dataset)?;
-    let (kept, deleted) = apply(&snapshots, Utc::now(), config);
-    if !dry_run {
-        for snap in &deleted {
-            client::destroy_snapshot(snap)?;
+    let (kept, candidates) = apply(&snapshots, Utc::now(), config);
+
+    // One batched `zfs holds -H` call covers all candidates instead of N individual calls.
+    let holds_map = client::batch_snapshot_holds(&candidates)?;
+
+    let mut deleted = Vec::new();
+    let mut hold_skipped = Vec::new();
+    for snap in candidates {
+        let empty = Vec::new();
+        let zrb_holds = zrb_holds_from_tags(
+            holds_map.get(&snap).unwrap_or(&empty),
+        );
+        if zrb_holds.is_empty() {
+            if !dry_run {
+                client::destroy_snapshot(&snap)?;
+            }
+            deleted.push(snap);
+        } else {
+            for tag in &zrb_holds {
+                log::info!("skipped {snap} (Transfer Hold: {tag})");
+                hold_skipped.push((snap.clone(), tag.clone()));
+            }
         }
     }
+
     Ok(PruneResult {
         kept,
         deleted,
         resume_skipped: false,
+        hold_skipped,
     })
 }
 
@@ -189,5 +224,41 @@ mod tests {
             resume_decision(true, Some(ancient), now(), None),
             ResumeDecision::Expire
         );
+    }
+
+    // ── zrb_holds_from_tags ───────────────────────────────────────────────
+
+    #[test]
+    fn empty_holds_gives_empty_vec() {
+        assert_eq!(zrb_holds_from_tags(&[]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn non_zrb_holds_excluded() {
+        let holds = vec!["manual".to_owned(), "other-tool:data".to_owned()];
+        assert_eq!(zrb_holds_from_tags(&holds), Vec::<String>::new());
+    }
+
+    #[test]
+    fn single_zrb_hold_returned_as_is() {
+        let holds = vec!["zrb:primary".to_owned()];
+        assert_eq!(zrb_holds_from_tags(&holds), vec!["zrb:primary"]);
+    }
+
+    #[test]
+    fn multiple_zrb_holds_all_returned() {
+        let holds = vec![
+            "zrb:primary".to_owned(),
+            "zrb:offsite".to_owned(),
+            "manual".to_owned(),
+        ];
+        let got = zrb_holds_from_tags(&holds);
+        assert_eq!(got, vec!["zrb:primary", "zrb:offsite"]);
+    }
+
+    #[test]
+    fn server_side_received_tag_is_a_zrb_hold() {
+        let holds = vec!["zrb:received".to_owned()];
+        assert_eq!(zrb_holds_from_tags(&holds), vec!["zrb:received"]);
     }
 }

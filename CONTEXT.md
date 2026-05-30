@@ -19,7 +19,17 @@ The compound operation of: creating a Snapshot on the Source, connecting to the 
 Creates a zrb-prefixed Snapshot locally without transferring it to the Remote. Subcommand: `zrb snapshot`.
 
 ## Incremental Base
-The snapshot chosen as the base for `zfs send -i`. Selected by estimating the transfer size (`zfs send -n -v`) for each snapshot present on both Source and Remote, then picking the one with the smallest estimated size.
+The snapshot used as the base for `zfs send -i`. Must be the most recent snapshot on the Remote's target dataset — ZFS rejects any incremental stream whose base is not the destination's head. Selected by finding the most recent snapshot present on both Source and Remote (by ISO-8601 name ordering). If the Remote's most recent snapshot is absent from the Source (divergence), the Send fails with a clear error. If the Remote has no snapshots, a full send is performed instead.
+
+## Transfer Hold
+A ZFS hold placed on a snapshot to prevent Prune from deleting the most recently transferred snapshot, eliminating the race where both sides independently prune the same snapshot.
+
+Two symmetric holds are maintained:
+
+- **Source-side**: tagged `zrb:<remote-name>` (e.g. `zrb:backup-server`), placed on the source snapshot immediately after it is confirmed received by the Remote. One hold per Remote. When a newer snapshot is successfully sent to the same Remote, the old hold is released and a new one is placed on the newer snapshot.
+- **Remote-side**: tagged `zrb:received`, placed on the destination snapshot immediately after `zfs receive` completes successfully. One hold per dataset on the Remote.
+
+Prune on either side skips any snapshot carrying a `zrb:*` hold and prints a notice showing the hold tag. Removal of an orphaned hold (e.g. after a Remote is decommissioned) is a manual operation: `zfs release zrb:<remote-name> <snapshot>` on the Source or `zfs release zrb:received <snapshot>` on the Remote.
 
 ## Prune
 The operation of deleting snapshots that fall outside the Retention Policy. Runs locally on whichever host invokes it — Source and Remote prune independently. No cross-host communication. Subcommand: `zrb prune`.
@@ -46,7 +56,7 @@ The mode in which zrb runs on the Remote, invoked via SSH `ForceCommand`. Handle
 
 ## Protocol
 The structured communication between client (Source) and server (Remote) over a single SSH connection. The client speaks first:
-1. **Handshake phase** — JSON messages: client sends `ClientHello` (declaring its Client Name, target dataset, and compiled version); server validates the version (major and minor must match) and replies with `ServerStatus` (version accept/reject). If rejected, server closes and client surfaces the message. If accepted, server then sends `ServerHello` (its snapshot list and any pending Resume Token).
+1. **Handshake phase** — JSON messages: client sends `ClientHello` (declaring its Client Name, target dataset, and compiled version); server validates the version (major and minor must match) and replies with `ServerStatus` (version accept/reject). If rejected, server closes and client surfaces the message. If accepted, server then sends `ServerHello` (its most recent Snapshot on the target dataset, or absent if none, and any pending Resume Token).
 2. **Ready phase** — JSON: client sends `ClientReady` after evaluating whether it has data to send. If `ok: false` (e.g. newest snapshot already on the Remote), the server exits cleanly without spawning `zfs receive`. If `ok: true`, the transfer phase begins.
 3. **Transfer phase** — binary stream: fixed 4 MB Chunks, each followed by a Control Frame. The client selects the Incremental Base locally (from snapshots common to both sides) and begins streaming immediately after `ClientReady`.
 4. **Status phase** — JSON: server reports success or error after the stream ends.

@@ -87,7 +87,7 @@ src/
     ├── snapshot.rs  — zrb snapshot
     ├── list.rs      — zrb list
     ├── send.rs      — zrb send / zrb send --resume
-    ├── prune.rs     — zrb prune / prune --all / prune --dry-run / prune --abort-resume
+    ├── prune.rs     — zrb prune / prune --dry-run / prune --abort-resume
     └── server.rs    — zrb server (ForceCommand handler)
 ```
 
@@ -114,15 +114,18 @@ Four phases over one SSH connection:
 ```
 Source → Remote   ClientHello  { version, client_name, target_dataset }
 Remote → Source   ServerStatus { ok: bool, message? }   ← version gate
-Remote → Source   ServerHello  { snapshots: [...], resume_token? }
+Remote → Source   ServerHello  { head: <snap | null>, resume_token? }
 ```
 
 The server validates that client and server share the same *major.minor* version (patch differences are tolerated — ADR
 0005). If the check fails, `ServerStatus.ok` is `false` and the server closes; the client surfaces the message and
 exits. No transfer happens.
 
-After accepting, the server sends its snapshot list and any pending resume token. The client picks the incremental base
-locally by estimating transfer size (`zfs send -n -v`) for each common snapshot and choosing the smallest.
+After accepting, the server sends its most recent zrb-managed snapshot (`head`) and any pending resume token. The client
+uses `head` as the incremental base — it must exist in the local snapshot list. If `head` is absent locally, the send
+fails with a divergence error ("prune it from the Remote and retry"). If `head` is `null`, no prior backups exist on
+the Remote and the client performs a full send. The server sends only this single snapshot name (not the full list) to
+minimise wire overhead — ADR 0008.
 
 **2. Ready (JSON)**
 
@@ -146,7 +149,13 @@ present, the client issues `zfs send -t <token>` — incremental base selection 
 Remote → Source   ServerStatus { ok: bool, message? }
 ```
 
-The Remote reports success or error after `zfs receive` completes.
+The Remote reports success or error after `zfs receive` completes. On success:
+- **Source-side**: a `zrb:<remote-name>` ZFS hold is placed on the sent snapshot, preventing prune from deleting the
+  incremental base before the Remote has a chance to prune its own older snapshots.
+- **Server-side**: a `zrb:received` ZFS hold is placed on the just-received snapshot for the same reason.
+
+`zrb prune` skips any snapshot carrying a `zrb:*` hold and logs a notice. Holds are moved atomically (new hold placed
+before old hold is released) so there is never a window with zero holds on the dataset.
 
 The security boundary is ZFS delegation (`zfs allow`) — it restricts which datasets the backup OS user can write to at
 the kernel level. The `allowed_datasets` list in `ServerConfig` and the Client Name binding are defence-in-depth, not

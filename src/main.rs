@@ -160,6 +160,13 @@ fn print_prune_dry_run(groups: &[(String, ops::prune::PruneResult)]) {
                 DryRunEntry::Delete(name) => println!("  \u{2717}           {name}"),
             }
         }
+        // Deduplicate by snapshot name before printing held entries.
+        let mut seen = std::collections::HashSet::new();
+        for (snap, tag) in &result.hold_skipped {
+            if seen.insert(snap) {
+                println!("  \u{23f8} held       {snap} ({tag})");
+            }
+        }
     }
 }
 
@@ -348,14 +355,23 @@ async fn run() -> anyhow::Result<()> {
                 print_prune_dry_run(&results);
             } else {
                 for (ds, result) in &results {
+                    let held: std::collections::HashSet<&str> = result
+                        .hold_skipped
+                        .iter()
+                        .map(|(s, _)| s.as_str())
+                        .collect();
                     log::info!(
-                        "pruned {}: kept {}, deleted {}",
+                        "pruned {}: kept {}, deleted {}, held {}",
                         ds,
                         result.kept.len(),
-                        result.deleted.len()
+                        result.deleted.len(),
+                        held.len(),
                     );
                     for s in &result.deleted {
                         log::debug!("deleted {s}");
+                    }
+                    for s in &held {
+                        log::debug!("held (Transfer Hold) {s}");
                     }
                 }
             }

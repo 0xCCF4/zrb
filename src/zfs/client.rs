@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::process::{Command, Stdio};
 
 use chrono::{DateTime, Utc};
@@ -268,6 +269,133 @@ pub fn set_resume_since(dataset: &str, ts: DateTime<Utc>) -> Result<(), ClientEr
     run(cmd).map(|_| ())
 }
 
+/// Place a hold tagged `tag` on `snapshot`.
+///
+/// # Errors
+/// Returns [`ClientError`] if the process cannot be spawned or exits non-zero.
+pub fn hold_snapshot(snapshot: &str, tag: &str) -> Result<(), ClientError> {
+    log::trace!("zfs hold {tag} {snapshot}");
+    let mut cmd = Command::new("zfs");
+    cmd.args(["hold", tag, snapshot]);
+    run(cmd).map(|_| ())
+}
+
+/// Release the hold tagged `tag` from `snapshot`.
+///
+/// Idempotent: returns `Ok(())` if the hold does not exist.
+///
+/// # Errors
+/// Returns [`ClientError`] if the process cannot be spawned or exits non-zero
+/// for a reason other than the hold already being absent.
+pub fn release_hold(snapshot: &str, tag: &str) -> Result<(), ClientError> {
+    log::trace!("zfs release {tag} {snapshot}");
+    let mut cmd = Command::new("zfs");
+    cmd.args(["release", tag, snapshot]);
+    match run(cmd) {
+        Ok(_) => Ok(()),
+        Err(ClientError::CommandFailed { ref stderr }) if stderr.contains("no such tag") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Return the list of hold tags currently on `snapshot`.
+///
+/// # Errors
+/// Returns [`ClientError`] if the process cannot be spawned or exits non-zero.
+pub fn snapshot_holds(snapshot: &str) -> Result<Vec<String>, ClientError> {
+    log::trace!("zfs holds -H {snapshot}");
+    let mut cmd = Command::new("zfs");
+    cmd.args(["holds", "-H", snapshot]);
+    let output = run(cmd)?;
+    Ok(parse_holds_output(&output))
+}
+
+fn parse_holds_output(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            fields.next(); // snapshot name
+            fields.next().map(str::to_owned) // hold tag
+        })
+        .collect()
+}
+
+/// Scan all zrb-managed snapshots for `dataset` and return the full snapshot
+/// name carrying `tag`, or `None` if none does.
+///
+/// # Errors
+/// Returns [`ClientError`] if any ZFS process cannot be spawned or exits non-zero.
+pub fn find_held_snapshot(dataset: &str, tag: &str) -> Result<Option<String>, ClientError> {
+    let snapshots = list_snapshots(dataset)?;
+    find_held_snapshot_in(&snapshots, tag)
+}
+
+/// Like [`find_held_snapshot`] but takes an already-fetched snapshot list,
+/// avoiding a redundant `zfs list` call when the caller already has the list.
+///
+/// # Errors
+/// Returns [`ClientError`] if the `zfs holds` process cannot be spawned or exits non-zero.
+pub fn find_held_snapshot_in(
+    snapshots: &[String],
+    tag: &str,
+) -> Result<Option<String>, ClientError> {
+    if snapshots.is_empty() {
+        return Ok(None);
+    }
+    let mut cmd = Command::new("zfs");
+    cmd.args(["holds", "-H"]);
+    cmd.args(snapshots);
+    let output = run(cmd)?;
+    for line in output.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let Some(snap_name) = fields.next() else {
+            continue;
+        };
+        let Some(hold_tag) = fields.next() else {
+            continue;
+        };
+        if hold_tag == tag {
+            return Ok(Some(snap_name.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// Check holds on multiple snapshots in a single `zfs holds -H` invocation.
+///
+/// Returns a map of snapshot name → hold tags. Snapshots with no holds are absent
+/// from the map. If `snapshots` is empty, returns an empty map without spawning
+/// any process.
+///
+/// # Errors
+/// Returns [`ClientError`] if the process cannot be spawned or exits non-zero.
+pub fn batch_snapshot_holds(
+    snapshots: &[String],
+) -> Result<HashMap<String, Vec<String>>, ClientError> {
+    if snapshots.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut cmd = Command::new("zfs");
+    cmd.args(["holds", "-H"]);
+    cmd.args(snapshots);
+    let output = run(cmd)?;
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for line in output.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let Some(snap_name) = fields.next() else {
+            continue;
+        };
+        let Some(hold_tag) = fields.next() else {
+            continue;
+        };
+        map.entry(snap_name.to_owned())
+            .or_default()
+            .push(hold_tag.to_owned());
+    }
+    Ok(map)
+}
+
 /// Clear the `zrb:resume-since` user property on `dataset`.
 ///
 /// Safe to call when the property is not set (inherits from parent, which is
@@ -396,5 +524,30 @@ mod tests {
     fn resume_token_real_value_is_some() {
         let tok = "1-abcdef0123456789abcdef0123456789";
         assert_eq!(parse_resume_token(tok), Some(tok.to_owned()));
+    }
+
+    #[test]
+    fn parse_holds_empty_output_gives_empty_vec() {
+        assert_eq!(parse_holds_output(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_holds_extracts_tag_column() {
+        let out = "tank/data@snap1\tzrb:primary\tFri May 29 12:00 2026\n";
+        assert_eq!(parse_holds_output(out), vec!["zrb:primary"]);
+    }
+
+    #[test]
+    fn parse_holds_multiple_snapshots_multiple_tags() {
+        let out = "tank/data@snap1\tzrb:primary\tdate\ntank/data@snap2\tzrb:offsite\tdate\n";
+        let got = parse_holds_output(out);
+        assert_eq!(got, vec!["zrb:primary", "zrb:offsite"]);
+    }
+
+    #[test]
+    fn parse_holds_multiple_tags_on_same_snapshot() {
+        let out = "tank/data@snap1\tzrb:primary\tdate\ntank/data@snap1\tzrb:offsite\tdate\n";
+        let got = parse_holds_output(out);
+        assert_eq!(got, vec!["zrb:primary", "zrb:offsite"]);
     }
 }

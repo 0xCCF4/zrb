@@ -124,12 +124,14 @@ pub async fn run_server_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     let resume_token = zfs::get_resume_token(&request.target).context("checking resume token")?;
 
     let raw_snaps = zfs::list_snapshots(&request.target).context("listing snapshots")?;
-    let snapshots = naming::filter_zrb(&raw_snaps);
+    let mut zrb_snaps = naming::filter_zrb(&raw_snaps);
+    naming::sort_chronological(&mut zrb_snaps);
+    let head = zrb_snaps.into_iter().last();
 
     codec::encode_server_hello(
         &ServerHello {
             version: env!("CARGO_PKG_VERSION").to_owned(),
-            snapshots,
+            head,
             resume_token,
         },
         output,
@@ -160,6 +162,7 @@ pub async fn run_server_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         }
         Ok(false) => match recv.finish().await {
             Ok(()) => {
+                place_server_transfer_hold(&request.target);
                 codec::encode_server_status(
                     &ServerStatus {
                         ok: true,
@@ -190,6 +193,42 @@ pub async fn run_server_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         }
     }
     Ok(())
+}
+
+fn place_server_transfer_hold(dataset: &str) {
+    const TAG: &str = "zrb:received";
+    // Use the zrb-filtered, chronologically sorted snapshot list — one call serves
+    // both finding the old hold and identifying the newest snapshot.
+    let snaps = match crate::ops::list::list(dataset) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("Transfer Hold (server): failed to list snapshots for {dataset}: {e}");
+            return;
+        }
+    };
+    let Some(newest) = snaps.last() else {
+        log::warn!("Transfer Hold (server): no snapshots found for {dataset}");
+        return;
+    };
+    let old = match zfs::find_held_snapshot_in(&snaps, TAG) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("Transfer Hold (server): failed to find existing hold for {dataset}: {e}");
+            None
+        }
+    };
+    if old.as_deref() == Some(newest.as_str()) {
+        return;
+    }
+    if let Err(e) = zfs::hold_snapshot(newest, TAG) {
+        log::warn!("Transfer Hold (server): failed to hold {newest}: {e}");
+        return;
+    }
+    if let Some(old_snap) = old.filter(|s| s != newest)
+        && let Err(e) = zfs::release_hold(&old_snap, TAG)
+    {
+        log::warn!("Transfer Hold (server): failed to release old hold on {old_snap}: {e}");
+    }
 }
 
 fn annotate_resume_if_needed(dataset: &str) -> anyhow::Result<()> {
@@ -315,9 +354,9 @@ monthly_for_days = 730
     async fn version_patch_difference_is_accepted() {
         let cfg = test_config();
         let permitted = ["my-laptop"];
-        // Current version is 0.1.0; send 0.1.99 — patch diff only, must be accepted.
+        // Current version is 0.2.0; send 0.2.99 — patch diff only, must be accepted.
         let input_bytes =
-            make_client_hello_with_version("0.1.99", "my-laptop", "backup/laptop/home").await;
+            make_client_hello_with_version("0.2.99", "my-laptop", "backup/laptop/home").await;
         let mut output = Vec::new();
         // Ignore the result: run_server_on may fail on the ZFS call that follows the
         // version gate (zfs binary absent in sandbox). We only care about the first
