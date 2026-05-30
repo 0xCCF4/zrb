@@ -1,5 +1,7 @@
 use std::io::{self, Stdout};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+
 
 use anyhow::Context;
 use crossterm::event::{Event, EventStream};
@@ -15,6 +17,94 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::Receiver;
+
+const SUMMARY_TIMEOUT_OK_SECS: u8 = 10;
+const SUMMARY_TIMEOUT_FAIL_SECS: u8 = 30;
+
+// ── Buffering logger ──────────────────────────────────────────────────────────
+
+struct StoredRecord {
+    level: log::Level,
+    target: String,
+    args: String,
+}
+
+struct TuiLogger {
+    inner: env_logger::Logger,
+    buffer: Mutex<Option<Vec<StoredRecord>>>,
+}
+
+impl log::Log for TuiLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        self.inner.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.inner.enabled(record.metadata()) {
+            return;
+        }
+        let mut guard = self.buffer.lock().unwrap();
+        if let Some(buf) = &mut *guard {
+            buf.push(StoredRecord {
+                level: record.level(),
+                target: record.target().to_owned(),
+                args: record.args().to_string(),
+            });
+        } else {
+            drop(guard);
+            self.inner.log(record);
+        }
+    }
+
+    fn flush(&self) {
+        self.inner.flush();
+    }
+}
+
+static LOGGER: OnceLock<TuiLogger> = OnceLock::new();
+
+/// Install the global logger. Call once at startup instead of `env_logger::init`.
+///
+/// While no TUI alternate screen is active, records pass straight through to
+/// the inner `env_logger`. While an alternate screen is active (inside
+/// [`run_countdown`] or [`run_transfer`]) records are buffered and replayed to
+/// the restored terminal on exit.
+///
+/// # Panics
+/// Panics if a global logger has already been installed by a prior call.
+pub fn init_logger(level: &str) {
+    let inner = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(level),
+    )
+    .build();
+    let max_level = inner.filter();
+    let logger = TuiLogger { inner, buffer: Mutex::new(None) };
+    if LOGGER.set(logger).is_ok() {
+        log::set_logger(LOGGER.get().unwrap()).expect("logger already set");
+        log::set_max_level(max_level);
+    }
+}
+
+fn start_buffering() {
+    if let Some(logger) = LOGGER.get() {
+        let mut buffer_lock = logger.buffer.lock().unwrap();
+        if buffer_lock.is_none() {
+            *buffer_lock = Some(Vec::new());
+        }
+    }
+}
+
+fn stop_and_replay() {
+    let Some(logger) = LOGGER.get() else { return };
+    let records = {
+        let mut guard = logger.buffer.lock().unwrap();
+        guard.take().unwrap_or_default()
+    };
+    // Lock released before replay so log:: calls can re-acquire it (they pass through when buffer is None).
+    for r in records {
+        log::log!(target: &r.target, r.level, "{}", r.args);
+    }
+}
 
 // ── Events ───────────────────────────────────────────────────────────────────
 
@@ -106,7 +196,7 @@ impl TuiApp {
             state: TuiState::Countdown { remaining: 5 },
             remotes: vec![],
             focused: 0,
-            summary_countdown: 2,
+            summary_countdown: SUMMARY_TIMEOUT_OK_SECS,
             cancellation_tokens: std::collections::HashMap::new(),
         }
     }
@@ -122,7 +212,7 @@ impl TuiApp {
             state: TuiState::Transferring,
             remotes,
             focused: 0,
-            summary_countdown: 2,
+            summary_countdown: SUMMARY_TIMEOUT_OK_SECS,
             cancellation_tokens,
         }
     }
@@ -138,7 +228,7 @@ impl TuiApp {
             state: TuiState::Transferring,
             remotes,
             focused: 0,
-            summary_countdown: 2,
+            summary_countdown: SUMMARY_TIMEOUT_OK_SECS,
             cancellation_tokens,
         }
     }
@@ -260,7 +350,7 @@ impl TuiApp {
                         .remotes
                         .iter()
                         .any(|r| matches!(r.state, RemoteRowState::Failed { .. }));
-                    self.summary_countdown = if any_failed { 30 } else { 2 };
+                    self.summary_countdown = if any_failed { SUMMARY_TIMEOUT_FAIL_SECS } else { SUMMARY_TIMEOUT_OK_SECS };
                     self.state = TuiState::Summary;
                 }
             }
@@ -353,6 +443,7 @@ pub async fn run_countdown(datasets: &[(String, Vec<String>)]) -> anyhow::Result
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+    start_buffering();
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("create terminal")?;
@@ -362,6 +453,7 @@ pub async fn run_countdown(datasets: &[(String, Vec<String>)]) -> anyhow::Result
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
     terminal.show_cursor().ok();
+    stop_and_replay();
 
     result
 }
@@ -412,7 +504,7 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp, datasets: &[(String, Vec<String>)
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            " ZFS Backup ",
+            " ZRB ZFS Backup ",
             Style::default().add_modifier(Modifier::BOLD),
         ))
         .title_alignment(Alignment::Center);
@@ -514,6 +606,7 @@ pub async fn run_transfer(
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+    start_buffering();
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("create terminal")?;
@@ -523,6 +616,7 @@ pub async fn run_transfer(
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
     terminal.show_cursor().ok();
+    stop_and_replay();
 
     result
 }
@@ -590,14 +684,26 @@ fn summary_title(app: &TuiApp) -> &'static str {
 fn render_transfer(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
 
-    let title = match app.state {
-        TuiState::Summary | TuiState::Exiting => summary_title(app),
-        _ => " ZFS Backup ",
+    let is_summary = matches!(app.state, TuiState::Summary | TuiState::Exiting);
+    let any_bad = app.remotes.iter().any(|r| {
+        matches!(r.state, RemoteRowState::Failed { .. } | RemoteRowState::Skipped)
+    });
+
+    let title = if is_summary { summary_title(app) } else { " ZRB ZFS Backup " };
+
+    let border_color = if is_summary {
+        if any_bad { Color::Red } else { Color::Green }
+    } else {
+        Color::Reset
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled(title, Style::default().add_modifier(Modifier::BOLD)))
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            title,
+            Style::default().add_modifier(Modifier::BOLD).fg(border_color),
+        ))
         .title_alignment(Alignment::Center);
 
     let inner = block.inner(area);
@@ -606,60 +712,9 @@ fn render_transfer(frame: &mut Frame<'_>, app: &TuiApp) {
     let name_w = app.remotes.iter().map(|r| r.name.len()).max().unwrap_or(8);
 
     let mut lines: Vec<Line<'_>> = vec![Line::default()];
-
     for (i, row) in app.remotes.iter().enumerate() {
         let focused = i == app.focused && matches!(app.state, TuiState::Transferring);
-        let name_style = if focused {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
-        let name_span = Span::styled(format!("{:<width$}", row.name, width = name_w), name_style);
-
-        let line = match &row.state {
-            RemoteRowState::Waiting => Line::from(vec![
-                name_span,
-                Span::raw("  "),
-                Span::styled("waiting\u{2026}", Style::default().fg(Color::DarkGray)),
-            ]),
-            RemoteRowState::Active { bytes_sent, total_bytes, speed_bps, eta_secs } => {
-                let pct: u8 = if *total_bytes > 0 {
-                    u8::try_from((bytes_sent * 100 / total_bytes).min(100)).unwrap_or(100)
-                } else {
-                    0
-                };
-                let bar = make_bar(pct, 16);
-                let speed_str = fmt_speed(*speed_bps);
-                let eta_str = eta_secs.map_or_else(|| "ETA ?".to_owned(), |s| format!("ETA {}", fmt_duration(s)));
-                Line::from(vec![
-                    name_span,
-                    Span::raw(format!(
-                        "  [{bar}] {pct:>3}%  {} / {}  {speed_str}  {eta_str}",
-                        fmt_bytes(*bytes_sent),
-                        fmt_bytes(*total_bytes),
-                    )),
-                ])
-            }
-            RemoteRowState::Done { bytes, elapsed_secs } => Line::from(vec![
-                name_span,
-                Span::styled(
-                    format!("  \u{2713} {}  {}", fmt_bytes(*bytes), fmt_duration(*elapsed_secs)),
-                    Style::default().add_modifier(Modifier::BOLD).fg(Color::Green),
-                ),
-            ]),
-            RemoteRowState::Failed { error } => Line::from(vec![
-                name_span,
-                Span::styled(
-                    format!("  \u{2717} {}", truncate_str(error, 40)),
-                    Style::default().add_modifier(Modifier::REVERSED).fg(Color::Red),
-                ),
-            ]),
-            RemoteRowState::Skipped => Line::from(vec![
-                name_span,
-                Span::styled("  skipped", Style::default().add_modifier(Modifier::DIM)),
-            ]),
-        };
-        lines.push(line);
+        lines.push(render_remote_row(row, name_w, focused));
     }
 
     lines.push(Line::default());
@@ -668,7 +723,7 @@ fn render_transfer(frame: &mut Frame<'_>, app: &TuiApp) {
         TuiState::Transferring => {
             lines.push(
                 Line::from(Span::styled(
-                    "[S] Skip remote   [Q] Quit & shutdown",
+                    "[S] Skip remote   [Q] Quit",
                     Style::default().fg(Color::DarkGray),
                 ))
                 .alignment(Alignment::Center),
@@ -677,7 +732,7 @@ fn render_transfer(frame: &mut Frame<'_>, app: &TuiApp) {
         TuiState::Summary => {
             lines.push(
                 Line::from(Span::styled(
-                    format!("Closing in {}\u{2026}", app.summary_countdown),
+                    format!("Closing in {}s \u{2014} press any key to dismiss", app.summary_countdown),
                     Style::default().fg(Color::DarkGray),
                 ))
                 .alignment(Alignment::Center),
@@ -698,6 +753,60 @@ fn render_transfer(frame: &mut Frame<'_>, app: &TuiApp) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn render_remote_row(row: &RemoteRow, name_w: usize, focused: bool) -> Line<'_> {
+    let name_style = if focused {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
+    let name_span = Span::styled(format!("{:<width$}", row.name, width = name_w), name_style);
+
+    match &row.state {
+        RemoteRowState::Waiting => Line::from(vec![
+            name_span,
+            Span::raw("  "),
+            Span::styled("waiting\u{2026}", Style::default().fg(Color::DarkGray)),
+        ]),
+        RemoteRowState::Active { bytes_sent, total_bytes, speed_bps, eta_secs } => {
+            let pct: u8 = if *total_bytes > 0 {
+                u8::try_from((bytes_sent * 100 / total_bytes).min(100)).unwrap_or(100)
+            } else {
+                0
+            };
+            let bar = make_bar(pct, 16);
+            let speed_str = fmt_speed(*speed_bps);
+            let eta_str = eta_secs
+                .map_or_else(|| "ETA ?".to_owned(), |s| format!("ETA {}", fmt_duration(s)));
+            Line::from(vec![
+                name_span,
+                Span::raw(format!(
+                    "  [{bar}] {pct:>3}%  {} / {}  {speed_str}  {eta_str}",
+                    fmt_bytes(*bytes_sent),
+                    fmt_bytes(*total_bytes),
+                )),
+            ])
+        }
+        RemoteRowState::Done { bytes, elapsed_secs } => Line::from(vec![
+            name_span,
+            Span::styled(
+                format!("  \u{2713} {}  {}", fmt_bytes(*bytes), fmt_duration(*elapsed_secs)),
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Green),
+            ),
+        ]),
+        RemoteRowState::Failed { error } => Line::from(vec![
+            name_span,
+            Span::styled(
+                format!("  \u{2717} {}", truncate_str(error, 40)),
+                Style::default().add_modifier(Modifier::REVERSED).fg(Color::Red),
+            ),
+        ]),
+        RemoteRowState::Skipped => Line::from(vec![
+            name_span,
+            Span::styled("  skipped", Style::default().add_modifier(Modifier::DIM)),
+        ]),
+    }
+}
+
 fn make_bar(pct: u8, width: usize) -> String {
     let filled = (pct as usize * width / 100).min(width);
     "\u{2588}".repeat(filled) + &"\u{2591}".repeat(width - filled)
@@ -705,15 +814,15 @@ fn make_bar(pct: u8, width: usize) -> String {
 
 #[allow(clippy::cast_precision_loss)]
 fn fmt_bytes(bytes: u64) -> String {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    const MIB: u64 = 1024 * 1024;
-    const KIB: u64 = 1024;
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.0} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.0} KiB", bytes as f64 / KIB as f64)
+    const GB: u64 = 1_000_000_000;
+    const MB: u64 = 1_000_000;
+    const KB: u64 = 1_000;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.0} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0} KB", bytes as f64 / KB as f64)
     } else {
         format!("{bytes} B")
     }
@@ -977,15 +1086,15 @@ mod tests {
     // ── Issue 04: Summary screen state machine ────────────────────────────────
 
     #[test]
-    fn summary_countdown_starts_at_2_when_no_failures() {
+    fn summary_countdown_starts_at_ok_timeout_when_no_failures() {
         let mut app = TuiApp::for_transfer(vec!["r".into()]);
         app.handle_send_event(&SendEvent::AllDone);
         assert_eq!(app.state, TuiState::Summary);
-        assert_eq!(app.summary_countdown, 2);
+        assert_eq!(app.summary_countdown, SUMMARY_TIMEOUT_OK_SECS);
     }
 
     #[test]
-    fn summary_countdown_starts_at_30_when_remote_failed() {
+    fn summary_countdown_starts_at_fail_timeout_when_remote_failed() {
         let mut app = TuiApp::for_transfer(vec!["r".into()]);
         app.handle_send_event(&SendEvent::RemoteFailed {
             remote: "r".into(),
@@ -993,16 +1102,16 @@ mod tests {
         });
         app.handle_send_event(&SendEvent::AllDone);
         assert_eq!(app.state, TuiState::Summary);
-        assert_eq!(app.summary_countdown, 30);
+        assert_eq!(app.summary_countdown, SUMMARY_TIMEOUT_FAIL_SECS);
     }
 
     #[test]
-    fn summary_countdown_is_2_when_only_skipped() {
+    fn summary_countdown_is_ok_timeout_when_only_skipped() {
         let mut app = TuiApp::for_transfer(vec!["r".into()]);
         app.handle_send_event(&SendEvent::RemoteSkipped { remote: "r".into() });
         app.handle_send_event(&SendEvent::AllDone);
         assert_eq!(app.state, TuiState::Summary);
-        assert_eq!(app.summary_countdown, 2);
+        assert_eq!(app.summary_countdown, SUMMARY_TIMEOUT_OK_SECS);
     }
 
     #[test]
@@ -1011,15 +1120,16 @@ mod tests {
         app.handle_send_event(&SendEvent::AllDone);
         app.handle_send_event(&SendEvent::SummaryTick);
         assert_eq!(app.state, TuiState::Summary, "still Summary after one tick");
-        assert_eq!(app.summary_countdown, 1);
+        assert_eq!(app.summary_countdown, SUMMARY_TIMEOUT_OK_SECS - 1);
     }
 
     #[test]
-    fn two_summary_ticks_transition_to_exiting() {
+    fn enough_summary_ticks_transition_to_exiting() {
         let mut app = TuiApp::for_transfer(vec!["r".into()]);
         app.handle_send_event(&SendEvent::AllDone);
-        app.handle_send_event(&SendEvent::SummaryTick);
-        app.handle_send_event(&SendEvent::SummaryTick);
+        for _ in 0..SUMMARY_TIMEOUT_OK_SECS {
+            app.handle_send_event(&SendEvent::SummaryTick);
+        }
         assert_eq!(app.state, TuiState::Exiting);
     }
 

@@ -24,6 +24,45 @@ use crate::zfs::{client as zfs, estimator};
 /// # Errors
 /// Returns `Err` only on pre-send failures (snapshot creation or config lookup).
 /// Per-remote send errors are logged, not propagated.
+async fn send_one_dataset(
+    dataset: String,
+    config: SourceConfig,
+    remote_filter: Option<Vec<String>>,
+    sequential: bool,
+    event_tx: Option<Sender<SendEvent>>,
+    cancel_map: Option<CancelMap>,
+) -> (String, anyhow::Result<()>) {
+    let result: anyhow::Result<()> = async {
+        let latest = ops_snapshot::snapshot(&dataset, &config)
+            .with_context(|| format!("creating snapshot for {dataset}"))?;
+        let local_snaps = ops_list::list(&dataset)
+            .with_context(|| format!("listing local snapshots for {dataset}"))?;
+        let dataset_remotes = config
+            .datasets
+            .get(&dataset)
+            .ok_or_else(|| anyhow::anyhow!("dataset '{dataset}' not found in config"))?;
+        let filter_refs: Option<Vec<&str>> =
+            remote_filter.as_deref().map(|v| v.iter().map(String::as_str).collect());
+        let tasks = collect_tasks(dataset_remotes, filter_refs.as_deref(), &config.remotes)?;
+        dispatch_tasks(
+            &latest, &local_snaps, config.name(), &dataset, tasks,
+            sequential, false, event_tx, cancel_map.as_ref(),
+        )
+        .await;
+        Ok(())
+    }
+    .await;
+    (dataset, result)
+}
+
+/// Back up `datasets` to all configured Remotes (or a named subset).
+///
+/// Datasets are sent in parallel unless `sequential` is true. Per-dataset
+/// failures are logged as warnings; all other datasets continue. Returns `Err`
+/// after all datasets have been attempted if any failed.
+///
+/// # Errors
+/// Returns `Err` if any dataset fails (snapshot, config lookup, or transfer).
 pub async fn send(
     datasets: &[&str],
     remote_filter: Option<&[&str]>,
@@ -32,35 +71,43 @@ pub async fn send(
     event_tx: Option<Sender<SendEvent>>,
     cancel_map: Option<CancelMap>,
 ) -> anyhow::Result<()> {
-    for &dataset in datasets {
-        let latest = ops_snapshot::snapshot(dataset, config)
-            .with_context(|| format!("creating snapshot for {dataset}"))?;
+    let remote_filter_owned: Option<Vec<String>> =
+        remote_filter.map(|f| f.iter().map(|&s| s.to_owned()).collect());
 
-        let local_snaps = ops_list::list(dataset)
-            .with_context(|| format!("listing local snapshots for {dataset}"))?;
-
-        let dataset_remotes = config
-            .datasets
-            .get(dataset)
-            .ok_or_else(|| anyhow::anyhow!("dataset '{dataset}' not found in config"))?;
-
-        let tasks = collect_tasks(dataset_remotes, remote_filter, &config.remotes)?;
-
-        dispatch_tasks(
-            &latest,
-            &local_snaps,
-            config.name(),
-            dataset,
-            tasks,
-            sequential,
-            false,
-            event_tx.clone(),
-            cancel_map.as_ref(),
-        )
-        .await;
+    let mut failed = false;
+    if sequential {
+        for &ds in datasets {
+            let (dataset, result) = send_one_dataset(
+                ds.to_owned(), config.clone(), remote_filter_owned.clone(),
+                sequential, event_tx.clone(), cancel_map.clone(),
+            ).await;
+            if let Err(e) = result {
+                log::warn!("send {dataset}: {e:#}");
+                failed = true;
+            }
+        }
+    } else {
+        let mut set: JoinSet<(String, anyhow::Result<()>)> = JoinSet::new();
+        for &ds in datasets {
+            set.spawn(send_one_dataset(
+                ds.to_owned(), config.clone(), remote_filter_owned.clone(),
+                sequential, event_tx.clone(), cancel_map.clone(),
+            ));
+        }
+        while let Some(joined) = set.join_next().await {
+            let (dataset, result) = joined?;
+            if let Err(e) = result {
+                log::warn!("send {dataset}: {e:#}");
+                failed = true;
+            }
+        }
     }
+
     if let Some(ref tx) = event_tx {
         let _ = tx.send(SendEvent::AllDone).await;
+    }
+    if failed {
+        anyhow::bail!("one or more datasets failed to send");
     }
     Ok(())
 }
@@ -75,6 +122,49 @@ pub async fn send(
 /// # Errors
 /// Returns `Err` if there are no local snapshots for a dataset, or on pre-send
 /// config failures. Per-remote errors are logged as warnings.
+async fn resume_one_dataset(
+    dataset: String,
+    config: SourceConfig,
+    remote_filter: Option<Vec<String>>,
+    sequential: bool,
+    event_tx: Option<Sender<SendEvent>>,
+    cancel_map: Option<CancelMap>,
+) -> (String, anyhow::Result<()>) {
+    let result: anyhow::Result<()> = async {
+        let local_snaps = ops_list::list(&dataset)
+            .with_context(|| format!("listing local snapshots for {dataset}"))?;
+        let newest = local_snaps
+            .last()
+            .ok_or_else(|| {
+                anyhow::anyhow!("no local snapshots for '{dataset}'; run `zrb send` first")
+            })?
+            .clone();
+        let dataset_remotes = config
+            .datasets
+            .get(&dataset)
+            .ok_or_else(|| anyhow::anyhow!("dataset '{dataset}' not found in config"))?;
+        let filter_refs: Option<Vec<&str>> =
+            remote_filter.as_deref().map(|v| v.iter().map(String::as_str).collect());
+        let tasks = collect_tasks(dataset_remotes, filter_refs.as_deref(), &config.remotes)?;
+        dispatch_tasks(
+            &newest, &local_snaps, config.name(), &dataset, tasks,
+            sequential, true, event_tx, cancel_map.as_ref(),
+        )
+        .await;
+        Ok(())
+    }
+    .await;
+    (dataset, result)
+}
+
+/// Resume interrupted transfers for `datasets` to all configured Remotes.
+///
+/// Datasets are processed in parallel unless `sequential` is true. Per-dataset
+/// failures are logged as warnings; all other datasets continue. Returns `Err`
+/// after all datasets have been attempted if any failed.
+///
+/// # Errors
+/// Returns `Err` if any dataset fails (no local snapshots, config lookup, or transfer).
 pub async fn send_resume(
     datasets: &[&str],
     remote_filter: Option<&[&str]>,
@@ -83,39 +173,43 @@ pub async fn send_resume(
     event_tx: Option<Sender<SendEvent>>,
     cancel_map: Option<CancelMap>,
 ) -> anyhow::Result<()> {
-    for &dataset in datasets {
-        let local_snaps = ops_list::list(dataset)
-            .with_context(|| format!("listing local snapshots for {dataset}"))?;
+    let remote_filter_owned: Option<Vec<String>> =
+        remote_filter.map(|f| f.iter().map(|&s| s.to_owned()).collect());
 
-        let newest = local_snaps
-            .last()
-            .ok_or_else(|| {
-                anyhow::anyhow!("no local snapshots for '{dataset}'; run `zrb send` first")
-            })?
-            .clone();
-
-        let dataset_remotes = config
-            .datasets
-            .get(dataset)
-            .ok_or_else(|| anyhow::anyhow!("dataset '{dataset}' not found in config"))?;
-
-        let tasks = collect_tasks(dataset_remotes, remote_filter, &config.remotes)?;
-
-        dispatch_tasks(
-            &newest,
-            &local_snaps,
-            config.name(),
-            dataset,
-            tasks,
-            sequential,
-            true,
-            event_tx.clone(),
-            cancel_map.as_ref(),
-        )
-        .await;
+    let mut failed = false;
+    if sequential {
+        for &ds in datasets {
+            let (dataset, result) = resume_one_dataset(
+                ds.to_owned(), config.clone(), remote_filter_owned.clone(),
+                sequential, event_tx.clone(), cancel_map.clone(),
+            ).await;
+            if let Err(e) = result {
+                log::warn!("send --resume {dataset}: {e:#}");
+                failed = true;
+            }
+        }
+    } else {
+        let mut set: JoinSet<(String, anyhow::Result<()>)> = JoinSet::new();
+        for &ds in datasets {
+            set.spawn(resume_one_dataset(
+                ds.to_owned(), config.clone(), remote_filter_owned.clone(),
+                sequential, event_tx.clone(), cancel_map.clone(),
+            ));
+        }
+        while let Some(joined) = set.join_next().await {
+            let (dataset, result) = joined?;
+            if let Err(e) = result {
+                log::warn!("send --resume {dataset}: {e:#}");
+                failed = true;
+            }
+        }
     }
+
     if let Some(ref tx) = event_tx {
         let _ = tx.send(SendEvent::AllDone).await;
+    }
+    if failed {
+        anyhow::bail!("one or more datasets failed to resume");
     }
     Ok(())
 }
@@ -159,56 +253,59 @@ async fn dispatch_tasks(
 ) {
     if sequential {
         for (remote_name, remote_cfg, target) in &tasks {
-            let cancel = cancel_map.and_then(|m| m.get(remote_name)).cloned();
+            let row_key = format!("{dataset} \u{2192} {remote_name}");
+            let cancel = cancel_map.and_then(|m| m.get(&row_key)).cloned();
             let result = if is_resume {
                 resume_to_remote(
                     latest, local_snaps, remote_name, remote_cfg, target, client_name,
-                    event_tx.clone(), cancel,
+                    &row_key, event_tx.clone(), cancel,
                 )
                 .await
             } else {
                 send_to_remote(
                     latest, local_snaps, remote_name, remote_cfg, target, client_name,
-                    event_tx.clone(), cancel,
+                    &row_key, event_tx.clone(), cancel,
                 )
                 .await
             };
             if let Err(e) = result && !is_cancelled(&e) {
                 let verb = if is_resume { "resume" } else { "send" };
-                log::warn!("{verb} {dataset} -> {remote_name}: {e:#}");
+                log::warn!("{verb} {row_key}: {e:#}");
             }
         }
     } else {
         let mut set: JoinSet<(String, anyhow::Result<()>)> = JoinSet::new();
         for (remote_name, remote_cfg, target) in tasks {
-            let (latest, local_snaps, cname) = (
+            let (latest, local_snaps, cname, ds) = (
                 latest.to_owned(),
                 local_snaps.to_vec(),
                 client_name.to_owned(),
+                dataset.to_owned(),
             );
+            let row_key = format!("{ds} \u{2192} {remote_name}");
             let tx = event_tx.clone();
-            let cancel = cancel_map.and_then(|m| m.get(&remote_name)).cloned();
+            let cancel = cancel_map.and_then(|m| m.get(&row_key)).cloned();
             set.spawn(async move {
                 let result = if is_resume {
                     resume_to_remote(
                         &latest, &local_snaps, &remote_name, &remote_cfg, &target, &cname,
-                        tx, cancel,
+                        &row_key, tx, cancel,
                     )
                     .await
                 } else {
                     send_to_remote(
                         &latest, &local_snaps, &remote_name, &remote_cfg, &target, &cname,
-                        tx, cancel,
+                        &row_key, tx, cancel,
                     )
                     .await
                 };
-                (remote_name, result)
+                (row_key, result)
             });
         }
         while let Some(joined) = set.join_next().await {
-            if let Ok((rname, Err(e))) = joined && !is_cancelled(&e) {
+            if let Ok((row_key, Err(e))) = joined && !is_cancelled(&e) {
                 let verb = if is_resume { "resume" } else { "send" };
-                log::warn!("{verb} {dataset} -> {rname}: {e:#}");
+                log::warn!("{verb} {row_key}: {e:#}");
             }
         }
     }
@@ -222,6 +319,7 @@ async fn send_to_remote(
     remote_cfg: &RemoteConfig,
     target: &str,
     client_name: &str,
+    row_key: &str,
     event_tx: Option<Sender<SendEvent>>,
     cancel: Option<tokio_util::sync::CancellationToken>,
 ) -> anyhow::Result<()> {
@@ -239,7 +337,7 @@ async fn send_to_remote(
         client_name,
         &mut reader,
         &mut conn.stdin,
-        remote_name,
+        row_key,
         event_tx.clone(),
         cancel.as_ref(),
     )
@@ -264,7 +362,7 @@ async fn send_to_remote(
             if let Some(ref tx) = event_tx {
                 let _ = tx
                     .send(SendEvent::RemoteCompleted {
-                        remote: remote_name.to_owned(),
+                        remote: row_key.to_owned(),
                         elapsed_secs: elapsed_s,
                         bytes,
                     })
@@ -278,14 +376,14 @@ async fn send_to_remote(
                 if let Some(ref tx) = event_tx {
                     let _ = tx
                         .send(SendEvent::RemoteSkipped {
-                            remote: remote_name.to_owned(),
+                            remote: row_key.to_owned(),
                         })
                         .await;
                 }
             } else if let Some(ref tx) = event_tx {
                 let _ = tx
                     .send(SendEvent::RemoteFailed {
-                        remote: remote_name.to_owned(),
+                        remote: row_key.to_owned(),
                         error: e.to_string(),
                     })
                     .await;
@@ -308,6 +406,7 @@ async fn resume_to_remote(
     remote_cfg: &RemoteConfig,
     target: &str,
     client_name: &str,
+    row_key: &str,
     event_tx: Option<Sender<SendEvent>>,
     cancel: Option<tokio_util::sync::CancellationToken>,
 ) -> anyhow::Result<()> {
@@ -325,7 +424,7 @@ async fn resume_to_remote(
         client_name,
         &mut reader,
         &mut conn.stdin,
-        remote_name,
+        row_key,
         event_tx.clone(),
         cancel.as_ref(),
     )
@@ -350,7 +449,7 @@ async fn resume_to_remote(
             if let Some(ref tx) = event_tx {
                 let _ = tx
                     .send(SendEvent::RemoteCompleted {
-                        remote: remote_name.to_owned(),
+                        remote: row_key.to_owned(),
                         elapsed_secs: elapsed_s,
                         bytes,
                     })
@@ -364,14 +463,14 @@ async fn resume_to_remote(
                 if let Some(ref tx) = event_tx {
                     let _ = tx
                         .send(SendEvent::RemoteSkipped {
-                            remote: remote_name.to_owned(),
+                            remote: row_key.to_owned(),
                         })
                         .await;
                 }
             } else if let Some(ref tx) = event_tx {
                 let _ = tx
                     .send(SendEvent::RemoteFailed {
-                        remote: remote_name.to_owned(),
+                        remote: row_key.to_owned(),
                         error: e.to_string(),
                     })
                     .await;
@@ -401,7 +500,7 @@ pub async fn send_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     client_name: &str,
     reader: &mut R,
     writer: &mut W,
-    remote_name: &str,
+    row_key: &str,
     event_tx: Option<Sender<SendEvent>>,
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> anyhow::Result<u64> {
@@ -484,7 +583,7 @@ pub async fn send_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     if let Some(ref tx) = event_tx {
         let _ = tx
             .send(SendEvent::RemoteStarted {
-                remote: remote_name.to_owned(),
+                remote: row_key.to_owned(),
                 total_bytes,
             })
             .await;
@@ -493,14 +592,14 @@ pub async fn send_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     let mut bytes_sent: u64 = 0;
     {
         let bs = &mut bytes_sent;
-        let rn = remote_name.to_owned();
+        let rk = row_key.to_owned();
         let etx = event_tx;
         let cb: &mut (dyn FnMut(u64, u64) + Send) = &mut move |b: u64, _total: u64| {
             *bs = b;
             let _ = sd_notify::notify(&[NotifyState::Watchdog]);
             if let Some(ref tx) = etx {
                 let _ = tx.try_send(SendEvent::RemoteProgress {
-                    remote: rn.clone(),
+                    remote: rk.clone(),
                     bytes_sent: b,
                 });
             }
@@ -556,7 +655,7 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     client_name: &str,
     reader: &mut R,
     writer: &mut W,
-    remote_name: &str,
+    row_key: &str,
     event_tx: Option<Sender<SendEvent>>,
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> anyhow::Result<u64> {
@@ -651,7 +750,7 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     if let Some(ref tx) = event_tx {
         let _ = tx
             .send(SendEvent::RemoteStarted {
-                remote: remote_name.to_owned(),
+                remote: row_key.to_owned(),
                 total_bytes,
             })
             .await;
@@ -660,14 +759,14 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     let mut bytes_sent: u64 = 0;
     {
         let bs = &mut bytes_sent;
-        let rn = remote_name.to_owned();
+        let rk = row_key.to_owned();
         let etx = event_tx;
         let cb: &mut (dyn FnMut(u64, u64) + Send) = &mut move |b: u64, _total: u64| {
             *bs = b;
             let _ = sd_notify::notify(&[NotifyState::Watchdog]);
             if let Some(ref tx) = etx {
                 let _ = tx.try_send(SendEvent::RemoteProgress {
-                    remote: rn.clone(),
+                    remote: rk.clone(),
                     bytes_sent: b,
                 });
             }
@@ -750,22 +849,24 @@ fn select_incremental_base<'a>(
 /// propagates errors.
 pub fn place_transfer_hold(dataset: &str, snapshot: &str, remote_name: &str) {
     let tag = format!("zrb:{remote_name}");
-    let old = match zfs::find_held_snapshot(dataset, &tag) {
-        Ok(s) => s,
+    let old_snaps: Vec<String> = match zfs::find_held_snapshots(dataset, &tag) {
+        Ok(v) => v,
         Err(e) => {
-            log::warn!("Transfer Hold: failed to find existing hold for {dataset} ({remote_name}): {e}");
-            None
+            log::warn!("Transfer Hold: failed to find existing holds for {dataset} ({remote_name}): {e}");
+            vec![]
         }
     }
-    .filter(|s| s != snapshot);
+    .into_iter()
+    .filter(|s| s != snapshot)
+    .collect();
     if let Err(e) = zfs::hold_snapshot(snapshot, &tag) {
         log::warn!("Transfer Hold: failed to hold {snapshot} for {remote_name}: {e}");
         return;
     }
-    if let Some(old_snap) = old
-        && let Err(e) = zfs::release_hold(&old_snap, &tag)
-    {
-        log::warn!("Transfer Hold: failed to release old hold on {old_snap} for {remote_name}: {e}");
+    for old_snap in &old_snaps {
+        if let Err(e) = zfs::release_hold(old_snap, &tag) {
+            log::warn!("Transfer Hold: failed to release old hold on {old_snap} for {remote_name}: {e}");
+        }
     }
 }
 

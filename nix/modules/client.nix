@@ -46,6 +46,11 @@ let
 
   jobSubmodule = {
     options = with types; {
+      enable = mkOption {
+        type = bool;
+        default = true;
+        description = "Whether to enable this job.";
+      };
       onCalendar = mkOption {
         type = str;
         description = "systemd calendar expression.";
@@ -221,10 +226,10 @@ in
             };
           }
         )
-        cfg.jobs)
+        (filterAttrs (_: data: data.enable) cfg.jobs))
       (mkIf (cfg.prune.onCalendar != null) {
         zrb-prune = {
-          description = "zrb prune --all";
+          description = "zrb prune all";
           serviceConfig = {
             Type = "oneshot";
             User = cfg.user;
@@ -246,10 +251,10 @@ in
             };
           }
         )
-        cfg.jobs)
+        (filterAttrs (_: data: data.enable) cfg.jobs))
       (mkIf (cfg.prune.onCalendar != null) {
         zrb-prune = {
-          description = "Timer for zrb prune --all";
+          description = "Timer for zrb prune all";
           wantedBy = [ "timers.target" ];
           timerConfig = {
             OnCalendar = cfg.prune.onCalendar;

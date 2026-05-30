@@ -210,24 +210,27 @@ fn place_server_transfer_hold(dataset: &str) {
         log::warn!("Transfer Hold (server): no snapshots found for {dataset}");
         return;
     };
-    let old = match zfs::find_held_snapshot_in(&snaps, TAG) {
-        Ok(s) => s,
+    let old_snaps: Vec<String> = match zfs::find_held_snapshots_in(&snaps, TAG) {
+        Ok(v) => v,
         Err(e) => {
-            log::warn!("Transfer Hold (server): failed to find existing hold for {dataset}: {e}");
-            None
+            log::warn!("Transfer Hold (server): failed to find existing holds for {dataset}: {e}");
+            vec![]
         }
-    };
-    if old.as_deref() == Some(newest.as_str()) {
-        return;
+    }
+    .into_iter()
+    .filter(|s| s != newest)
+    .collect();
+    if old_snaps.is_empty() && snaps.last().is_some_and(|s| s == newest) {
+        // newest is already the only held snapshot — nothing to do
     }
     if let Err(e) = zfs::hold_snapshot(newest, TAG) {
         log::warn!("Transfer Hold (server): failed to hold {newest}: {e}");
         return;
     }
-    if let Some(old_snap) = old.filter(|s| s != newest)
-        && let Err(e) = zfs::release_hold(&old_snap, TAG)
-    {
-        log::warn!("Transfer Hold (server): failed to release old hold on {old_snap}: {e}");
+    for old_snap in &old_snaps {
+        if let Err(e) = zfs::release_hold(old_snap, TAG) {
+            log::warn!("Transfer Hold (server): failed to release old hold on {old_snap}: {e}");
+        }
     }
 }
 

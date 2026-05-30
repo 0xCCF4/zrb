@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Duration, Utc};
 
 use crate::ops::list as ops_list;
@@ -59,6 +61,32 @@ pub(crate) fn zrb_holds_from_tags(holds: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Classify `candidates` into snapshots to delete and snapshots to skip due to
+/// Transfer Holds, using a pre-fetched `holds_map` (snapshot → hold tags).
+///
+/// Returns `(to_delete, hold_skipped)` where `hold_skipped` is a vec of
+/// `(snapshot_name, hold_tag)` pairs — one entry per `zrb:*` tag on each
+/// protected snapshot.
+pub(crate) fn classify_candidates(
+    candidates: Vec<String>,
+    holds_map: &HashMap<String, Vec<String>>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let empty = Vec::new();
+    let mut to_delete = Vec::new();
+    let mut hold_skipped = Vec::new();
+    for snap in candidates {
+        let zrb_holds = zrb_holds_from_tags(holds_map.get(&snap).unwrap_or(&empty));
+        if zrb_holds.is_empty() {
+            to_delete.push(snap);
+        } else {
+            for tag in zrb_holds {
+                hold_skipped.push((snap.clone(), tag));
+            }
+        }
+    }
+    (to_delete, hold_skipped)
+}
+
 /// Apply the Retention Policy to `dataset` and destroy out-of-policy snapshots.
 ///
 /// If the dataset has an unexpired resume token (`Wait`), snapshot deletion is
@@ -116,25 +144,18 @@ pub fn prune(
 
     // One batched `zfs holds -H` call covers all candidates instead of N individual calls.
     let holds_map = client::batch_snapshot_holds(&candidates)?;
+    let (to_delete, hold_skipped) = classify_candidates(candidates, &holds_map);
+
+    for (snap, tag) in &hold_skipped {
+        log::info!("skipped {snap} (Transfer Hold: {tag})");
+    }
 
     let mut deleted = Vec::new();
-    let mut hold_skipped = Vec::new();
-    for snap in candidates {
-        let empty = Vec::new();
-        let zrb_holds = zrb_holds_from_tags(
-            holds_map.get(&snap).unwrap_or(&empty),
-        );
-        if zrb_holds.is_empty() {
-            if !dry_run {
-                client::destroy_snapshot(&snap)?;
-            }
-            deleted.push(snap);
-        } else {
-            for tag in &zrb_holds {
-                log::info!("skipped {snap} (Transfer Hold: {tag})");
-                hold_skipped.push((snap.clone(), tag.clone()));
-            }
+    for snap in to_delete {
+        if !dry_run {
+            client::destroy_snapshot(&snap)?;
         }
+        deleted.push(snap);
     }
 
     Ok(PruneResult {
@@ -260,5 +281,62 @@ mod tests {
     fn server_side_received_tag_is_a_zrb_hold() {
         let holds = vec!["zrb:received".to_owned()];
         assert_eq!(zrb_holds_from_tags(&holds), vec!["zrb:received"]);
+    }
+
+    // ── classify_candidates ───────────────────────────────────────────────
+
+    fn holds(snap: &str, tags: &[&str]) -> (String, Vec<String>) {
+        (snap.to_owned(), tags.iter().map(|t| (*t).to_owned()).collect())
+    }
+
+    #[test]
+    fn no_holds_all_candidates_go_to_delete() {
+        let candidates = vec!["tank/data@zrb-A".to_owned(), "tank/data@zrb-B".to_owned()];
+        let map = std::collections::HashMap::new();
+        let (to_delete, hold_skipped) = classify_candidates(candidates.clone(), &map);
+        assert_eq!(to_delete, candidates);
+        assert!(hold_skipped.is_empty());
+    }
+
+    #[test]
+    fn zrb_held_snapshot_goes_to_hold_skipped_not_deleted() {
+        let candidates = vec!["tank/data@zrb-A".to_owned()];
+        let map = [holds("tank/data@zrb-A", &["zrb:backup"])].into_iter().collect();
+        let (to_delete, hold_skipped) = classify_candidates(candidates, &map);
+        assert!(to_delete.is_empty());
+        assert_eq!(hold_skipped, vec![("tank/data@zrb-A".to_owned(), "zrb:backup".to_owned())]);
+    }
+
+    #[test]
+    fn non_zrb_hold_does_not_protect_snapshot() {
+        let candidates = vec!["tank/data@zrb-A".to_owned()];
+        let map = [holds("tank/data@zrb-A", &["manual"])].into_iter().collect();
+        let (to_delete, hold_skipped) = classify_candidates(candidates.clone(), &map);
+        assert_eq!(to_delete, candidates);
+        assert!(hold_skipped.is_empty());
+    }
+
+    #[test]
+    fn multiple_zrb_tags_on_one_snapshot_produces_multiple_hold_skipped_entries() {
+        let candidates = vec!["tank/data@zrb-A".to_owned()];
+        let map = [holds("tank/data@zrb-A", &["zrb:primary", "zrb:offsite"])].into_iter().collect();
+        let (to_delete, hold_skipped) = classify_candidates(candidates, &map);
+        assert!(to_delete.is_empty());
+        assert_eq!(hold_skipped.len(), 2);
+        assert!(hold_skipped.contains(&("tank/data@zrb-A".to_owned(), "zrb:primary".to_owned())));
+        assert!(hold_skipped.contains(&("tank/data@zrb-A".to_owned(), "zrb:offsite".to_owned())));
+    }
+
+    #[test]
+    fn mix_of_held_and_unheld_classified_correctly() {
+        let candidates = vec![
+            "tank/data@zrb-A".to_owned(),
+            "tank/data@zrb-B".to_owned(),
+            "tank/data@zrb-C".to_owned(),
+        ];
+        let map = [holds("tank/data@zrb-B", &["zrb:backup"])].into_iter().collect();
+        let (to_delete, hold_skipped) = classify_candidates(candidates, &map);
+        assert_eq!(to_delete, vec!["tank/data@zrb-A", "tank/data@zrb-C"]);
+        assert_eq!(hold_skipped, vec![("tank/data@zrb-B".to_owned(), "zrb:backup".to_owned())]);
     }
 }
