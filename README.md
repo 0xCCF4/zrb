@@ -24,8 +24,9 @@ Source (laptop)  ──SSH──►  Remote (backup server)
 
 `zrb send` works in two phases over a single SSH connection:
 
-1. **Handshake** — the server sends its snapshot list; the client compares it against its
-   own and picks the base that minimises the transfer size.
+1. **Handshake** — the server reports its most recent snapshot; the client uses it as the
+   incremental base (or falls back to a full send if the server has no snapshots). If the
+   server's head is absent from the local history, the send fails with a clear error.
 2. **Transfer** — the client runs `zfs send` and pipes the stream to `zfs receive` on the
    server. If a previous transfer was interrupted, the client resumes it via ZFS native
    resume tokens before starting the next send.
@@ -65,10 +66,10 @@ ssh-keygen -t ed25519 -f ~/.ssh/id_zrb -C "zrb backup key"
 Delegate the minimum permissions to the user that will run `zrb` on each dataset you intend to back up:
 
 ```sh
-zfs allow -u <user> snapshot,send,destroy,mount tank/home
+zfs allow -u <user> snapshot,send,hold,destroy,mount tank/home
 ```
 
-`snapshot` and `send` are required for `zrb send`; `destroy,mount` is required for `zrb prune`.
+`snapshot` and `send` are required for `zrb send`; `hold` is required for Transfer Holds (protecting the last-sent snapshot from being pruned); `destroy,mount` is required for `zrb prune`.
 
 ### 3. Create a dedicated user on the Remote
 
@@ -98,7 +99,7 @@ The `--client` flag lists which client names this key is permitted to present. A
 Delegate only the necessary permissions to the `zfsbackup` user on the dataset subtree it will receive into:
 
 ```sh
-zfs allow -u <user> receive,create,destroy,mount backup/laptop
+zfs allow -u <user> receive,create,hold,destroy,mount backup/laptop
 ```
 
 Keep the delegation as narrow as possible — per-dataset subtree, not the whole pool.
@@ -203,23 +204,27 @@ Lists all `zrb`-managed snapshots for a dataset.
 zrb list tank/home
 ```
 
-### `zrb prune <dataset>`
+### `zrb prune`
 
-Deletes snapshots that fall outside the Retention Policy. (Does only affect local zfs pool)
+Deletes snapshots that fall outside the Retention Policy on the local host.
 
 ```sh
-zrb prune tank/home
-zrb prune tank/home --recursive
+# Prune the datasets declared in the config file (client: datasets map; server: all allow lists)
+zrb prune
+
+# Prune specific datasets only
+zrb prune tank/home tank/documents
 
 # Preview what would be deleted without touching anything
-zrb prune tank/home --dry-run
+zrb prune --dry-run
 
 # Abort a stuck in-progress resume transfer and prune anyway
-zrb prune tank/home --abort-resume
+zrb prune --abort-resume
 ```
 
-`--dry-run` prints each snapshot with its keep reason (`daily`, `weekly`, `monthly`, `yearly`) or a deletion marker. No
-ZFS mutations are made.
+`--dry-run` prints each snapshot with its keep reason (`daily`, `weekly`, `monthly`, `yearly`) or a deletion marker.
+Snapshots carrying a Transfer Hold (`zrb:*`) are shown with a ⏸ marker — they are protected from deletion until the
+next successful send moves the hold. No ZFS mutations are made.
 
 `--abort-resume` overrides the `resume_hold_days` guard on the Remote: it discards the pending resume token and prunes
 regardless. Use when a partially-received transfer is no longer worth resuming.
@@ -313,12 +318,17 @@ inputs = {
       publicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... zrb backup key";
       allow = [ "backup/laptop/home" "backup/laptop/documents" ];
     };
+
+    # Optional: prune the server's backup datasets on a schedule.
+    # Targets the union of all clients' allow lists.
+    prune.onCalendar = "weekly";
   };
 }
 ```
 
 The module creates the `zrb` system user, writes `/etc/zrb/main/server.toml`, and adds a `ForceCommand`-restricted entry
-to the user's `authorized_keys` for each client that has a `publicKey` set. You still need to grant ZFS permissions
+to the user's `authorized_keys` for each client that has a `publicKey` set. When `prune.onCalendar` is set, a
+`zrb-server-prune-<name>` systemd service and timer are generated. You still need to grant ZFS permissions
 imperatively.
 
 ### Client

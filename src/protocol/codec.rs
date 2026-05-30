@@ -12,7 +12,7 @@ const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerHello {
     pub version: String,
-    pub snapshots: Vec<String>,
+    pub head: Option<String>,
     pub resume_token: Option<String>,
 }
 
@@ -316,8 +316,8 @@ mod tests {
     #[tokio::test]
     async fn server_hello_round_trip() {
         let msg = ServerHello {
-            version: "0.1.0".to_string(),
-            snapshots: vec!["tank/home@zrb-2026-05-22T14:30:00Z".to_string()],
+            version: "0.2.0".to_string(),
+            head: Some("tank/home@zrb-2026-05-22T14:30:00Z".to_string()),
             resume_token: Some("opaque-token".to_string()),
         };
         let mut buf = Vec::new();
@@ -329,10 +329,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_hello_no_resume_token() {
+    async fn server_hello_no_head_no_resume_token() {
         let msg = ServerHello {
-            version: "0.1.0".to_string(),
-            snapshots: vec![],
+            version: "0.2.0".to_string(),
+            head: None,
             resume_token: None,
         };
         let mut buf = Vec::new();

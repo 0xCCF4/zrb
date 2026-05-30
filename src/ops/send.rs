@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::future::Future;
 
 type CancelMap = HashMap<String, tokio_util::sync::CancellationToken>;
 
@@ -252,6 +251,7 @@ async fn send_to_remote(
     let elapsed_s = start.elapsed().as_secs_f64();
     match result {
         Ok(bytes) => {
+            place_transfer_hold(dataset, latest, remote_name);
             #[allow(clippy::cast_precision_loss)]
             let rate_mbs = if elapsed_s > 0.0 {
                 bytes as f64 / 1_000_000.0 / elapsed_s
@@ -337,6 +337,7 @@ async fn resume_to_remote(
     let elapsed_s = start.elapsed().as_secs_f64();
     match result {
         Ok(bytes) => {
+            place_transfer_hold(dataset, latest, remote_name);
             #[allow(clippy::cast_precision_loss)]
             let rate_mbs = if elapsed_s > 0.0 {
                 bytes as f64 / 1_000_000.0 / elapsed_s
@@ -426,52 +427,32 @@ pub async fn send_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         .await
         .context("reading ServerHello")?;
 
-    log::debug!("server has {} snapshot(s)", hello.snapshots.len());
+    log::debug!("server head: {:?}", hello.head);
 
-    let stream_res = if let Some(ref token) = hello.resume_token {
+    let stream_res: anyhow::Result<_> = if let Some(ref token) = hello.resume_token {
         log::debug!("resume token present; using zfs send -t");
         let size = estimate_resume_size(token, &remote_cfg.zfs_send_opts).await;
         zfs::send_resume(token, &remote_cfg.zfs_send_opts)
             .context("zfs send -t")
             .map(|out| (out, size))
     } else {
-        let server_names: std::collections::HashSet<&str> = hello
-            .snapshots
-            .iter()
-            .filter_map(|s| s.split_once('@').map(|(_, n)| n))
-            .collect();
-        let common: Vec<String> = local_snaps
-            .iter()
-            .filter(|s| {
-                s.split_once('@')
-                    .is_some_and(|(_, n)| server_names.contains(n))
-            })
-            .cloned()
-            .collect();
-        log::debug!(
-            "{} local, {} server, {} common snapshot(s)",
-            local_snaps.len(),
-            hello.snapshots.len(),
-            common.len()
-        );
-        best_base(&common, |cand| {
-            let c = cand.to_owned();
-            let opts = remote_cfg.zfs_send_opts.clone();
-            let l = latest.to_owned();
-            async move { estimate_size(&c, &l, &opts).await }
-        })
-        .await
-        .context("selecting incremental base")
-        .and_then(|best| {
-            let (base_snap, estimate) = best.map_or((None, 0u64), |(s, e)| (Some(s), e));
-            match &base_snap {
-                Some(s) => log::debug!("incremental base: {s} (~{estimate} bytes estimated)"),
-                None => log::debug!("no common snapshots; sending full stream"),
+        match select_incremental_base(local_snaps, hello.head.as_deref())
+            .context("selecting incremental base")
+        {
+            Ok(base) => {
+                match base {
+                    Some(b) => log::debug!("incremental base: {b}"),
+                    None => log::debug!("no server snapshots; sending full stream"),
+                }
+                let estimate = estimate_size(base, latest, &remote_cfg.zfs_send_opts)
+                    .await
+                    .unwrap_or(0);
+                zfs::send_incremental(base, latest, &remote_cfg.zfs_send_opts)
+                    .context("zfs send")
+                    .map(|out| (out, estimate))
             }
-            zfs::send_incremental(base_snap.as_deref(), latest, &remote_cfg.zfs_send_opts)
-                .context("zfs send")
-                .map(|out| (out, estimate))
-        })
+            Err(e) => Err(e),
+        }
     };
 
     let (mut zfs_out, total_bytes) = match stream_res {
@@ -601,9 +582,9 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         .await
         .context("reading ServerHello")?;
 
-    log::debug!("server has {} snapshot(s)", hello.snapshots.len());
+    log::debug!("server head: {:?}", hello.head);
 
-    let stream_res = if let Some(ref token) = hello.resume_token {
+    let stream_res: anyhow::Result<_> = if let Some(ref token) = hello.resume_token {
         log::debug!("resume token present; using zfs send -t");
         let size = estimate_resume_size(token, &remote_cfg.zfs_send_opts).await;
         zfs::send_resume(token, &remote_cfg.zfs_send_opts)
@@ -612,51 +593,32 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     } else {
         let latest_suffix = latest.split_once('@').map_or(latest, |(_, n)| n);
         let on_server = hello
-            .snapshots
-            .iter()
-            .any(|s| s.split_once('@').is_some_and(|(_, n)| n == latest_suffix));
+            .head
+            .as_deref()
+            .and_then(|h| h.split_once('@'))
+            .is_some_and(|(_, n)| n == latest_suffix);
         if on_server {
             Err(anyhow::anyhow!(
                 "newest snapshot already on server; run `zrb send` to create a fresh backup"
             ))
         } else {
-            let server_names: std::collections::HashSet<&str> = hello
-                .snapshots
-                .iter()
-                .filter_map(|s| s.split_once('@').map(|(_, n)| n))
-                .collect();
-            let common: Vec<String> = local_snaps
-                .iter()
-                .filter(|s| {
-                    s.split_once('@')
-                        .is_some_and(|(_, n)| server_names.contains(n))
-                })
-                .cloned()
-                .collect();
-            log::debug!(
-                "{} local, {} server, {} common snapshot(s)",
-                local_snaps.len(),
-                hello.snapshots.len(),
-                common.len()
-            );
-            best_base(&common, |cand| {
-                let c = cand.to_owned();
-                let opts = remote_cfg.zfs_send_opts.clone();
-                let l = latest.to_owned();
-                async move { estimate_size(&c, &l, &opts).await }
-            })
-            .await
-            .context("selecting incremental base")
-            .and_then(|best| {
-                let (base_snap, estimate) = best.map_or((None, 0u64), |(s, e)| (Some(s), e));
-                match &base_snap {
-                    Some(s) => log::debug!("incremental base: {s} (~{estimate} bytes estimated)"),
-                    None => log::debug!("no common snapshots; sending full stream"),
+            match select_incremental_base(local_snaps, hello.head.as_deref())
+                .context("selecting incremental base")
+            {
+                Ok(base) => {
+                    match base {
+                        Some(b) => log::debug!("incremental base: {b}"),
+                        None => log::debug!("no server snapshots; sending full stream"),
+                    }
+                    let estimate = estimate_size(base, latest, &remote_cfg.zfs_send_opts)
+                        .await
+                        .unwrap_or(0);
+                    zfs::send_incremental(base, latest, &remote_cfg.zfs_send_opts)
+                        .context("zfs send")
+                        .map(|out| (out, estimate))
                 }
-                zfs::send_incremental(base_snap.as_deref(), latest, &remote_cfg.zfs_send_opts)
-                    .context("zfs send")
-                    .map(|out| (out, estimate))
-            })
+                Err(e) => Err(e),
+            }
         }
     };
 
@@ -741,6 +703,72 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     }
 }
 
+/// Select the Incremental Base for a ZFS send.
+///
+/// ZFS requires the base to be the **most recent snapshot on the destination**.
+/// The server sends only that snapshot as `head`. This function looks it up in
+/// `local_snaps` by matching the `@<name>` suffix.
+///
+/// Returns:
+/// - `Ok(None)` — server has no snapshots; caller should do a full send.
+/// - `Ok(Some(snap))` — `snap` is the local snapshot to use as `-i` base.
+/// - `Err(...)` — the Remote's head is absent from the Source; the stream
+///   would be rejected by `zfs receive`. The error message contains the
+///   missing snapshot name.
+fn select_incremental_base<'a>(
+    local_snaps: &'a [String],
+    head: Option<&str>,
+) -> anyhow::Result<Option<&'a str>> {
+    let Some(remote_head) = head else {
+        return Ok(None);
+    };
+    let head_name = remote_head.split_once('@').map_or("", |(_, n)| n);
+    local_snaps
+        .iter()
+        .find(|s| s.split_once('@').is_some_and(|(_, n)| n == head_name))
+        .map(|s| Some(s.as_str()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "histories have diverged: the Remote's most recent snapshot `{head_name}` \
+                 does not exist locally.\n\
+                 \n\
+                 This usually means the snapshot was deleted on this machine while not \
+                 yet deleted on the Remote, or the Remote was restored from a different \
+                 backup.\n\
+                 \n\
+                 To recover: delete any snapshots on the Remote that are newer than the \
+                 most recent snapshot shared with this machine, then retry."
+            )
+        })
+}
+
+/// Place or move the Transfer Hold for `remote_name` onto `snapshot`.
+///
+/// Ordering: the new hold is placed before the previous hold is released,
+/// so there is never a window with no hold on this dataset for `remote_name`.
+/// Hold/release failures are logged as warnings; the function never panics or
+/// propagates errors.
+pub fn place_transfer_hold(dataset: &str, snapshot: &str, remote_name: &str) {
+    let tag = format!("zrb:{remote_name}");
+    let old = match zfs::find_held_snapshot(dataset, &tag) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("Transfer Hold: failed to find existing hold for {dataset} ({remote_name}): {e}");
+            None
+        }
+    }
+    .filter(|s| s != snapshot);
+    if let Err(e) = zfs::hold_snapshot(snapshot, &tag) {
+        log::warn!("Transfer Hold: failed to hold {snapshot} for {remote_name}: {e}");
+        return;
+    }
+    if let Some(old_snap) = old
+        && let Err(e) = zfs::release_hold(&old_snap, &tag)
+    {
+        log::warn!("Transfer Hold: failed to release old hold on {old_snap} for {remote_name}: {e}");
+    }
+}
+
 fn remote_receive_error(msg: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "remote error: {msg}\nhint: the target dataset may need `zfs rollback` or the \
@@ -769,35 +797,20 @@ async fn estimate_resume_size(token: &str, opts: &[String]) -> u64 {
     estimate_from_output(&combined)
 }
 
-async fn estimate_size(candidate: &str, latest: &str, opts: &[String]) -> anyhow::Result<u64> {
-    let output = tokio::process::Command::new("zfs")
-        .args(["send", "-n", "-v", "-i", candidate, latest])
-        .args(opts)
-        .output()
-        .await
-        .context("running zfs send -n -v")?;
+async fn estimate_size(base: Option<&str>, latest: &str, opts: &[String]) -> anyhow::Result<u64> {
+    let mut cmd = tokio::process::Command::new("zfs");
+    cmd.args(["send", "-n", "-v"]);
+    if let Some(b) = base {
+        cmd.args(["-i", b]);
+    }
+    cmd.arg(latest).args(opts);
+    let output = cmd.output().await.context("running zfs send -n -v")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let size = estimator::parse_estimated_size(&stdout).map_err(|e| anyhow::anyhow!("{e}"))?;
-    log::trace!("size estimate {candidate} → {latest}: {size} bytes");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    let size = estimator::parse_estimated_size(&combined).map_err(|e| anyhow::anyhow!("{e}"))?;
+    log::trace!("size estimate {base:?} → {latest}: {size} bytes");
     Ok(size)
-}
-
-async fn best_base<F, Fut>(common: &[String], estimate: F) -> anyhow::Result<Option<(String, u64)>>
-where
-    F: Fn(&str) -> Fut,
-    Fut: Future<Output = anyhow::Result<u64>>,
-{
-    if common.is_empty() {
-        return Ok(None);
-    }
-    let mut best: Option<(String, u64)> = None;
-    for snap in common {
-        let size = estimate(snap).await?;
-        if best.as_ref().is_none_or(|(_, s)| size < *s) {
-            best = Some((snap.clone(), size));
-        }
-    }
-    Ok(best)
 }
 
 #[cfg(test)]
@@ -840,7 +853,7 @@ mod tests {
         let local_snaps = vec![latest.to_owned()];
         let hello = ServerHello {
             version: env!("CARGO_PKG_VERSION").to_owned(),
-            snapshots: vec!["backup/home@zrb-2026-01-20T00:00:00Z".to_owned()],
+            head: Some("backup/home@zrb-2026-01-20T00:00:00Z".to_owned()),
             resume_token: None,
         };
         let reader_bytes = version_ok_then_hello(&hello).await;
@@ -868,7 +881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_on_errors_when_newest_is_among_multiple_server_snapshots() {
+    async fn resume_on_errors_when_newest_snapshot_matches_server_head() {
         let latest = "tank/home@zrb-2026-01-20T00:00:00Z";
         let local_snaps = vec![
             "tank/home@zrb-2026-01-10T00:00:00Z".to_owned(),
@@ -876,10 +889,7 @@ mod tests {
         ];
         let hello = ServerHello {
             version: env!("CARGO_PKG_VERSION").to_owned(),
-            snapshots: vec![
-                "backup/home@zrb-2026-01-10T00:00:00Z".to_owned(),
-                "backup/home@zrb-2026-01-20T00:00:00Z".to_owned(),
-            ],
+            head: Some("backup/home@zrb-2026-01-20T00:00:00Z".to_owned()),
             resume_token: None,
         };
         let result = super::resume_on(
@@ -911,7 +921,7 @@ mod tests {
         let local_snaps = vec![latest.to_owned()];
         let hello = ServerHello {
             version: env!("CARGO_PKG_VERSION").to_owned(),
-            snapshots: vec!["backup/home@zrb-2026-01-20T00:00:00Z".to_owned()],
+            head: Some("backup/home@zrb-2026-01-20T00:00:00Z".to_owned()),
             resume_token: None,
         };
         let reader_bytes = version_ok_then_hello(&hello).await;
@@ -1025,60 +1035,118 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn no_common_snapshots_is_full_send() {
-        let result = best_base::<_, _>(&[], |_: &str| async { Ok(0u64) })
-            .await
-            .unwrap();
-        assert!(result.is_none());
+    // ── select_incremental_base ───────────────────────────────────────────
+
+    #[test]
+    fn full_send_when_server_has_no_snapshots() {
+        let local = vec!["tank/data@zrb-2026-01-01T00:00:00Z".to_owned()];
+        let result = select_incremental_base(&local, None).unwrap();
+        assert!(result.is_none(), "expected None (full send) when server has no snapshots");
     }
 
-    #[tokio::test]
-    async fn single_common_snapshot_is_selected() {
-        let common = vec!["tank/home@zrb-2026-01-01T00:00:00Z".to_owned()];
-        let (snap, size) = best_base(&common, |_: &str| async { Ok(1000u64) })
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(snap, "tank/home@zrb-2026-01-01T00:00:00Z");
-        assert_eq!(size, 1000);
-    }
-
-    #[tokio::test]
-    async fn smallest_estimate_wins() {
-        let snaps = [
-            "tank/home@zrb-2026-01-01T00:00:00Z",
-            "tank/home@zrb-2026-01-10T00:00:00Z",
-            "tank/home@zrb-2026-01-20T00:00:00Z",
+    #[test]
+    fn server_head_in_local_is_selected_as_base() {
+        let local = vec![
+            "tank/data@zrb-2026-01-01T00:00:00Z".to_owned(),
+            "tank/data@zrb-2026-01-10T00:00:00Z".to_owned(),
         ];
-        let common: Vec<String> = snaps.iter().map(|s| (*s).to_owned()).collect();
-        let (snap, size) = best_base(&common, |candidate: &str| {
-            let c = candidate.to_owned();
-            async move {
-                if c.contains("01-10") {
-                    Ok(200_u64)
-                } else if c.contains("01-01") {
-                    Ok(1_500_u64)
-                } else {
-                    Ok(900_u64)
-                }
-            }
-        })
-        .await
+        let base = select_incremental_base(
+            &local,
+            Some("backup/data@zrb-2026-01-10T00:00:00Z"),
+        )
         .unwrap()
         .unwrap();
-        assert_eq!(snap, "tank/home@zrb-2026-01-10T00:00:00Z");
-        assert_eq!(size, 200);
+        assert_eq!(base, "tank/data@zrb-2026-01-10T00:00:00Z");
+    }
+
+    #[test]
+    fn single_server_head_in_local_is_selected() {
+        let local = vec!["tank/data@zrb-2026-01-01T00:00:00Z".to_owned()];
+        let base = select_incremental_base(
+            &local,
+            Some("backup/data@zrb-2026-01-01T00:00:00Z"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(base, "tank/data@zrb-2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn error_when_remote_head_absent_from_local() {
+        let local = vec!["tank/data@zrb-2026-01-01T00:00:00Z".to_owned()];
+        let err = select_incremental_base(
+            &local,
+            Some("backup/data@zrb-2026-01-20T00:00:00Z"),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("zrb-2026-01-20T00:00:00Z"),
+            "error should include the missing snapshot name: {msg}"
+        );
+    }
+
+    // ── send_on / resume_on with mock streams ─────────────────────────────
+
+    #[tokio::test]
+    async fn send_on_errors_when_remote_head_absent_from_local() {
+        // Server's newest snapshot (Jan-20) is not in local_snaps — divergence error.
+        let latest = "tank/data@zrb-2026-01-25T00:00:00Z";
+        let local_snaps = vec![
+            "tank/data@zrb-2026-01-01T00:00:00Z".to_owned(),
+            latest.to_owned(),
+        ];
+        let hello = ServerHello {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            head: Some("backup/data@zrb-2026-01-20T00:00:00Z".to_owned()),
+            resume_token: None,
+        };
+        let result = send_on(
+            latest,
+            &local_snaps,
+            &test_remote_cfg(),
+            "backup/data",
+            "my-laptop",
+            &mut tokio::io::BufReader::new(Cursor::new(version_ok_then_hello(&hello).await)),
+            &mut tokio::io::sink(),
+            "primary",
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("zrb-2026-01-20"), "expected missing snapshot name in error: {msg}");
     }
 
     #[tokio::test]
-    async fn best_base_returns_estimate_alongside_snapshot() {
-        let common = vec!["tank/home@zrb-2026-01-01T00:00:00Z".to_owned()];
-        let (_, size) = best_base(&common, |_: &str| async { Ok(42_000u64) })
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(size, 42_000);
+    async fn resume_on_errors_when_remote_head_absent_from_local() {
+        let latest = "tank/data@zrb-2026-01-25T00:00:00Z";
+        let local_snaps = vec![
+            "tank/data@zrb-2026-01-01T00:00:00Z".to_owned(),
+            latest.to_owned(),
+        ];
+        let hello = ServerHello {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            head: Some("backup/data@zrb-2026-01-20T00:00:00Z".to_owned()),
+            resume_token: None,
+        };
+        let result = super::resume_on(
+            latest,
+            &local_snaps,
+            &test_remote_cfg(),
+            "backup/data",
+            "my-laptop",
+            &mut tokio::io::BufReader::new(Cursor::new(version_ok_then_hello(&hello).await)),
+            &mut tokio::io::sink(),
+            "primary",
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("zrb-2026-01-20"), "expected missing snapshot name in error: {msg}");
     }
 
     #[test]
@@ -1140,7 +1208,7 @@ mod tests {
     async fn resume_on_resume_token_errors_gracefully() {
         let hello = ServerHello {
             version: env!("CARGO_PKG_VERSION").to_owned(),
-            snapshots: vec![],
+            head: None,
             resume_token: Some("1-fake-resume-token".to_owned()),
         };
         let reader_bytes = version_ok_then_hello(&hello).await;
@@ -1169,7 +1237,7 @@ mod tests {
     async fn send_on_resume_token_errors_gracefully() {
         let hello = ServerHello {
             version: env!("CARGO_PKG_VERSION").to_owned(),
-            snapshots: vec![],
+            head: None,
             resume_token: Some("1-fake-resume-token".to_owned()),
         };
         let reader_bytes = version_ok_then_hello(&hello).await;
@@ -1228,7 +1296,7 @@ mod tests {
         let local_snaps = vec![latest.to_owned()];
         let hello = crate::protocol::codec::ServerHello {
             version: env!("CARGO_PKG_VERSION").to_owned(),
-            snapshots: vec!["backup/home@zrb-2026-01-20T00:00:00Z".to_owned()],
+            head: Some("backup/home@zrb-2026-01-20T00:00:00Z".to_owned()),
             resume_token: None,
         };
         let reader_bytes = version_ok_then_hello(&hello).await;
