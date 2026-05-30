@@ -354,9 +354,15 @@ monthly_for_days = 730
     async fn version_patch_difference_is_accepted() {
         let cfg = test_config();
         let permitted = ["my-laptop"];
-        // Current version is 0.2.0; send 0.2.99 — patch diff only, must be accepted.
+        // Derive major.minor from the crate version and use a different patch — must be accepted.
+        let major_minor = env!("CARGO_PKG_VERSION")
+            .rsplitn(2, '.')
+            .nth(1)
+            .unwrap_or("0.1");
+        let patched_version = format!("{major_minor}.99");
         let input_bytes =
-            make_client_hello_with_version("0.2.99", "my-laptop", "backup/laptop/home").await;
+            make_client_hello_with_version(&patched_version, "my-laptop", "backup/laptop/home")
+                .await;
         let mut output = Vec::new();
         // Ignore the result: run_server_on may fail on the ZFS call that follows the
         // version gate (zfs binary absent in sandbox). We only care about the first
