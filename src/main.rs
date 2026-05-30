@@ -51,8 +51,7 @@ enum Commands {
 
     /// Send snapshots to one or more configured Remotes.
     Send {
-        /// Datasets to send (e.g. tank/home tank/documents).
-        #[arg(required = true)]
+        /// Datasets to send (e.g. tank/home tank/documents). Omit to send all datasets from config.
         datasets: Vec<String>,
 
         /// Restrict send to a named Remote (repeatable).
@@ -187,8 +186,12 @@ fn print_grouped(groups: &[(String, Vec<String>)]) {
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let log_level = if cli.verbose { "debug" } else { "info" };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
+    if !matches!(cli.command, Commands::Completions { .. } | Commands::Man) {
+        check_zfs_version()?;
+    }
+
+    let log_level = if cli.verbose { "debug" } else { "warn" };
+    zrb::tui::init_logger(log_level);
 
     match cli.command {
         Commands::Snapshot { datasets } => {
@@ -228,6 +231,7 @@ async fn run() -> anyhow::Result<()> {
             let cfg_path = cli.config.unwrap_or_else(default_source_config);
             let cfg = config::load_source(&cfg_path)?;
             let _ = sd_notify::notify(&[NotifyState::Ready]);
+            let datasets = resolve_datasets(datasets, &cfg);
             let ds_refs: Vec<&str> = datasets.iter().map(String::as_str).collect();
             let filter: Option<Vec<&str>> = if remotes.is_empty() {
                 None
@@ -269,15 +273,15 @@ async fn run() -> anyhow::Result<()> {
                     return Ok(());
                 }
 
-                let mut remote_names: Vec<String> = display_info
+                let mut row_keys: Vec<String> = display_info
                     .iter()
-                    .flat_map(|(_, remotes)| remotes.iter().cloned())
-                    .collect::<std::collections::HashSet<_>>()
-                    .into_iter()
+                    .flat_map(|(ds, remotes)| {
+                        remotes.iter().map(move |r| format!("{ds} \u{2192} {r}"))
+                    })
                     .collect();
-                remote_names.sort_unstable();
+                row_keys.sort_unstable();
 
-                let cancel_map = zrb::tui::build_cancel_map(&remote_names);
+                let cancel_map = zrb::tui::build_cancel_map(&row_keys);
                 let cancel_for_send: std::collections::HashMap<_, _> = cancel_map
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
@@ -285,7 +289,7 @@ async fn run() -> anyhow::Result<()> {
 
                 let (tx, rx) = tokio::sync::mpsc::channel(256);
                 let tui_task =
-                    tokio::spawn(zrb::tui::run_transfer(rx, remote_names, cancel_map));
+                    tokio::spawn(zrb::tui::run_transfer(rx, row_keys, cancel_map));
 
                 Some((tx, tui_task, cancel_for_send))
             } else {
@@ -330,13 +334,13 @@ async fn run() -> anyhow::Result<()> {
             let (retention, hold_days, config_datasets) = config::load_server(&cfg_path)
                 .map(|c| {
                     let days = c.resume_hold_days();
-                    let ds = c.prune_datasets();
+                    let ds = c.configured_datasets();
                     (c.retention, Some(days), ds)
                 })
                 .or_else(|_| {
                     config::load_source(&cfg_path)
                         .map(|c| {
-                            let ds = c.prune_datasets();
+                            let ds = c.configured_datasets();
                             (c.retention, None, ds)
                         })
                 })?;
@@ -416,6 +420,48 @@ async fn run() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_zfs_version_line(line: &str) -> Result<(u32, u32, u32), String> {
+    let rest = line
+        .strip_prefix("zfs-")
+        .ok_or_else(|| format!("unexpected zfs version format: {line}"))?;
+    let semver = rest.split('-').next().unwrap_or(rest);
+    let parts: Vec<&str> = semver.split('.').collect();
+    if parts.len() < 3 {
+        return Err(format!("unexpected zfs version format: {line}"));
+    }
+    let parse = |s: &str| {
+        s.parse::<u32>()
+            .map_err(|_| format!("unexpected zfs version format: {line}"))
+    };
+    Ok((parse(parts[0])?, parse(parts[1])?, parse(parts[2])?))
+}
+
+fn check_zfs_version() -> anyhow::Result<()> {
+    let output = std::process::Command::new("zfs")
+        .arg("version")
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not determine zfs version: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first_line = stdout.lines().next().unwrap_or("").trim();
+    let (major, minor, _patch) = parse_zfs_version_line(first_line)
+        .map_err(|e| anyhow::anyhow!("could not determine zfs version: {e}"))?;
+    if (major, minor) < (2, 3) {
+        anyhow::bail!(
+            "zrb requires zfs >= 2.3.0, found {}",
+            first_line.trim_start_matches("zfs-")
+        );
+    }
+    Ok(())
+}
+
+fn resolve_datasets(explicit: Vec<String>, config: &config::SourceConfig) -> Vec<String> {
+    if explicit.is_empty() {
+        config.configured_datasets()
+    } else {
+        explicit
+    }
 }
 
 fn main() {
@@ -521,6 +567,15 @@ mod tests {
         let _ = SendEvent::RemoteSkipped { remote: "r".into() };
         let _ = SendEvent::CountdownTick { remaining_secs: 5 };
         let _ = SendEvent::CountdownAborted;
+    }
+
+    #[test]
+    fn send_no_args_parses() {
+        let cli = Cli::try_parse_from(["zrb", "send"]);
+        assert!(cli.is_ok(), "zrb send with no dataset args should parse (defaults to all config datasets)");
+        if let Ok(Cli { command: Commands::Send { datasets, .. }, .. }) = cli {
+            assert!(datasets.is_empty(), "datasets should be empty before resolve_datasets");
+        }
     }
 
     #[test]
@@ -724,5 +779,80 @@ mod tests {
         man.render(&mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains(".TH"), "man page should contain .TH roff header");
+    }
+
+    #[test]
+    fn version_parse_exact_floor_accepted() {
+        assert_eq!(parse_zfs_version_line("zfs-2.3.0-1").unwrap(), (2, 3, 0));
+    }
+
+    #[test]
+    fn version_parse_below_floor_rejected() {
+        let (major, minor, _) = parse_zfs_version_line("zfs-2.2.99-1").unwrap();
+        assert!((major, minor) < (2, 3), "2.2.x should be below floor");
+    }
+
+    #[test]
+    fn version_parse_patch_release_accepted() {
+        assert_eq!(parse_zfs_version_line("zfs-2.3.7-1").unwrap(), (2, 3, 7));
+    }
+
+    #[test]
+    fn version_parse_major_bump_accepted() {
+        assert_eq!(parse_zfs_version_line("zfs-3.0.0-1").unwrap(), (3, 0, 0));
+    }
+
+    #[test]
+    fn version_parse_ubuntu_build_tag_accepted() {
+        assert_eq!(
+            parse_zfs_version_line("zfs-2.3.7-0ubuntu1").unwrap(),
+            (2, 3, 7)
+        );
+    }
+
+    #[test]
+    fn version_parse_ubuntu_old_rejected() {
+        let (major, minor, _) =
+            parse_zfs_version_line("zfs-2.2.2-0ubuntu9.4").unwrap();
+        assert!((major, minor) < (2, 3));
+    }
+
+    #[test]
+    fn version_parse_malformed_is_err() {
+        assert!(parse_zfs_version_line("not-a-version").is_err());
+        assert!(parse_zfs_version_line("zfs-bad").is_err());
+    }
+
+    const RESOLVE_CFG_TOML: &str = r#"
+[source]
+name = "laptop"
+
+[remotes.primary]
+host = "backup.example.com"
+
+[datasets."tank/home"]
+primary = "backup/home"
+
+[datasets."tank/documents"]
+primary = "backup/documents"
+
+[retention]
+recent = 7
+weekly_for_days = 30
+monthly_for_days = 365
+"#;
+
+    #[test]
+    fn resolve_datasets_empty_returns_all_config_datasets() {
+        let cfg: config::SourceConfig = toml::from_str(RESOLVE_CFG_TOML).expect("should parse");
+        let result = resolve_datasets(vec![], &cfg);
+        assert_eq!(result, vec!["tank/documents", "tank/home"]);
+    }
+
+    #[test]
+    fn resolve_datasets_explicit_passthrough() {
+        let cfg: config::SourceConfig = toml::from_str(RESOLVE_CFG_TOML).expect("should parse");
+        let result = resolve_datasets(vec!["tank/home".to_owned()], &cfg);
+        assert_eq!(result, vec!["tank/home"]);
     }
 }

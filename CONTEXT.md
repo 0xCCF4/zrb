@@ -15,6 +15,13 @@ An explicit config entry that maps a source dataset path to its destination path
 ## Send
 The compound operation of: creating a Snapshot on the Source, connecting to the Remote via SSH, performing the structured Protocol handshake, and transferring the snapshot as an Incremental Send. Subcommand: `zrb send`.
 
+Two invocation forms:
+- `zrb send` — reads the target dataset list from the config file (keys of the `datasets` map) and sends each one. All datasets are sent in parallel to all configured Remotes; per-dataset failures are logged and do not abort other datasets in flight, but the command exits non-zero if any dataset failed.
+- `zrb send <dataset> [<dataset>...]` — sends exactly the listed datasets; ignores the config's dataset list. Same parallel behaviour as the no-argument form.
+
+One modifier flag usable with either form:
+- `--sequential` — sends datasets and Remotes one at a time instead of in parallel.
+
 ## Snapshot (subcommand)
 Creates a zrb-prefixed Snapshot locally without transferring it to the Remote. Subcommand: `zrb snapshot`.
 
