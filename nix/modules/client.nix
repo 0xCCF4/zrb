@@ -226,7 +226,7 @@ in
             };
           }
         )
-        (filterAttrs (_: data: data.enable) cfg.jobs))
+        cfg.jobs)
       (mkIf (cfg.prune.onCalendar != null) {
         zrb-prune = {
           description = "zrb prune all";

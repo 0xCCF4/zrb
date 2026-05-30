@@ -26,7 +26,7 @@ let
     };
   };
 
-  instanceSubmodule = { name, ... }: {
+  instanceSubmodule = { name, config, ... }: {
     options = with types; {
       enable = mkEnableOption "zrb server instance '${name}'";
       package = mkOption {
@@ -102,6 +102,27 @@ let
           description = "Whether the prune timer is persistent (catches up missed runs after downtime).";
           example = false;
         };
+        user = mkOption {
+          type = str;
+          default = "${config.user}-prune";
+          defaultText = literalExpression ''"''${user}-prune"'';
+          description = "User to run the prune service. Must have ZFS destroy and mount delegation on the backup datasets.";
+          example = "zrb-prune";
+        };
+        group = mkOption {
+          type = str;
+          default = "${config.user}-prune";
+          defaultText = literalExpression ''"''${user}-prune"'';
+          description = "Group for the prune user.";
+          example = "zrb-prune";
+        };
+        createUser = mkOption {
+          type = bool;
+          default = config.createUser;
+          defaultText = literalExpression "createUser";
+          description = "Create the prune system user and group. Mirrors createUser by default.";
+          example = false;
+        };
       };
     };
   };
@@ -140,7 +161,7 @@ in
               description = "zrb prune for server instance '${name}'";
               serviceConfig = {
                 Type = "oneshot";
-                User = icfg.user;
+                User = icfg.prune.user;
                 ExecStart = "${icfg.package}/bin/zrb prune --config /etc/zrb/${name}/server.toml";
               };
             };
@@ -185,7 +206,7 @@ in
           };
           user = icfg.user;
           group = icfg.group;
-          mode = "0640";
+          mode = "0644";
         }
       )
       enabledInstances;
@@ -209,6 +230,12 @@ in
                 useDefaultShell = true; # force command override command
               };
             })
+            (mkIf icfg.prune.createUser {
+              ${icfg.prune.user} = {
+                isSystemUser = true;
+                group = icfg.prune.group;
+              };
+            })
           ]
         )
         enabledInstances
@@ -217,7 +244,10 @@ in
     users.groups = mkMerge (
       mapAttrsToList
         (_: icfg:
-          mkIf icfg.createUser { ${icfg.group} = { }; }
+          mkMerge [
+            (mkIf icfg.createUser { ${icfg.group} = { }; })
+            (mkIf icfg.prune.createUser { ${icfg.prune.group} = { }; })
+          ]
         )
         enabledInstances
     );

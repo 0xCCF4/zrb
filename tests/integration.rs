@@ -1096,3 +1096,46 @@ fn send_on_emits_started_progress_completed_in_order() {
         assert!(*bytes_sent > 0);
     }
 }
+
+#[test]
+#[ignore = "requires ZFS and root privileges"]
+fn json_zfs_calls_round_trip_against_real_pool() {
+    if !zfs_available() {
+        eprintln!("SKIP: /dev/zfs not present — ZFS kernel module unavailable");
+        return;
+    }
+
+    let pool = ZfsTestPool::create("zrb-json-rt");
+    let dataset = pool.dataset("home");
+
+    Command::new("zfs")
+        .args(["create", &dataset])
+        .status()
+        .expect("zfs create dataset");
+
+    let snap_name = "zrb-2026-01-01T00:00:00Z";
+    zfs_client::create_snapshot(&dataset, snap_name).expect("create snapshot");
+    let full_snap = format!("{dataset}@{snap_name}");
+
+    // list_snapshots returns the snapshot
+    let snaps = zfs_client::list_snapshots(&dataset).expect("list_snapshots");
+    assert!(
+        snaps.contains(&full_snap),
+        "expected {full_snap} in list_snapshots, got {snaps:?}"
+    );
+
+    // discover_datasets includes the dataset
+    let discovered = zfs_client::discover_datasets().expect("discover_datasets");
+    assert!(
+        discovered.contains(&dataset),
+        "expected {dataset} in discover_datasets, got {discovered:?}"
+    );
+
+    // get_resume_token returns None (no transfer in progress)
+    let token = zfs_client::get_resume_token(&dataset).expect("get_resume_token");
+    assert_eq!(token, None, "expected no resume token on fresh dataset");
+
+    // get_resume_since returns None (property not set)
+    let since = zfs_client::get_resume_since(&dataset).expect("get_resume_since");
+    assert_eq!(since, None, "expected no resume-since on fresh dataset");
+}

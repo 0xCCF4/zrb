@@ -191,6 +191,24 @@ let
     }
   ];
 
+  clientDisabledJobCfg = mkNixos [
+    nixosModules.client
+    {
+      services.zrb.client = {
+        enable = true;
+        sourceName = "test-host";
+        remotes.backup = {
+          host = "backup.example.com";
+          user = "zrb";
+          sshKey = "/etc/zrb/id_ed25519";
+        };
+        datasets."tank/home".backup = "pool/home";
+        retention = { recent = 7; weeklyForDays = 30; monthlyForDays = 365; };
+        jobs.nightly = { enable = false; onCalendar = "daily"; datasets = [ "tank/home" ]; };
+      };
+    }
+  ];
+
   clientPruneCfg = mkNixos [
     nixosModules.client
     {
@@ -324,6 +342,16 @@ let
       (!serverNoUserCfg.users.users.zrb.isSystemUser)
       "createUser=false should not set isSystemUser=true on the zrb user")
 
+    # Server: prune user created as system user when instance is enabled
+    (lib.assertMsg
+      serverCfg.users.users."zrb-prune".isSystemUser
+      "zrb-prune user not created as system user when instance is enabled")
+
+    # Server: createUser=false also skips prune user creation
+    (lib.assertMsg
+      (!(serverNoUserCfg.users.users ? "zrb-prune") || !serverNoUserCfg.users.users."zrb-prune".isSystemUser)
+      "createUser=false should not set isSystemUser=true on the zrb-prune user")
+
     # Client: TOML generated at expected path
     (lib.assertMsg
       (clientCfg.environment.etc ? "zrb/client.toml")
@@ -363,6 +391,15 @@ let
     (lib.assertMsg
       clientCfg.systemd.timers."zrb-send-hourly".timerConfig.Persistent
       "zrb-send-hourly timer Persistent is not true")
+
+    # Client: job.enable=false produces service (for manual trigger) but no timer
+    (lib.assertMsg
+      (clientDisabledJobCfg.systemd.services ? "zrb-send-nightly")
+      "zrb-send-nightly service must exist when job.enable=false (needed for manual systemctl start)")
+
+    (lib.assertMsg
+      (!(clientDisabledJobCfg.systemd.timers ? "zrb-send-nightly"))
+      "zrb-send-nightly timer must not exist when job.enable=false")
 
     # Client: prune.onCalendar=null produces no prune service
     (lib.assertMsg
@@ -406,6 +443,11 @@ let
     (lib.assertMsg
       (serverPruneCfg.systemd.services ? "zrb-server-prune-backup")
       "zrb-server-prune-backup service not generated when prune.onCalendar=\"weekly\"")
+
+    # Server: prune service runs as the prune user, not the SSH server user
+    (lib.assertMsg
+      (serverPruneCfg.systemd.services."zrb-server-prune-backup".serviceConfig.User == "zrb-prune")
+      "zrb-server-prune-backup service User is not \"zrb-prune\"")
 
     # Server: prune service ExecStart contains "prune --config" (no --all)
     (lib.assertMsg

@@ -8,6 +8,8 @@ use tokio::process::{
     Command as TokioCommand,
 };
 
+use crate::zfs::schema::ZfsOutput;
+
 #[derive(Debug, Error)]
 pub enum ClientError {
     #[error("failed to spawn zfs process: {0}")]
@@ -52,21 +54,12 @@ pub fn create_snapshot(dataset: &str, snapshot_name: &str) -> Result<(), ClientE
 pub fn list_snapshots(dataset: &str) -> Result<Vec<String>, ClientError> {
     log::trace!("zfs list snapshots for {dataset}");
     let mut cmd = Command::new("zfs");
-    cmd.args(["list", "-t", "snapshot", "-H", "-o", "name", dataset]);
+    cmd.args(["list", "-t", "snapshot", "--json", dataset]);
     match run(cmd) {
-        Ok(stdout) => Ok(parse_list_output(&stdout)),
+        Ok(stdout) => decode_list_json(&stdout),
         Err(e) if is_dataset_not_found(&e) => Ok(vec![]),
         Err(e) => Err(e),
     }
-}
-
-fn parse_list_output(output: &str) -> Vec<String> {
-    output
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_owned)
-        .collect()
 }
 
 /// Destroy a snapshot by its full name (`<dataset>@<snapshot>`).
@@ -203,19 +196,15 @@ pub fn abort_resume(dataset: &str) -> Result<(), ClientError> {
 pub fn get_resume_token(dataset: &str) -> Result<Option<String>, ClientError> {
     log::trace!("zfs get receive_resume_token {dataset}");
     let mut cmd = Command::new("zfs");
-    cmd.args(["get", "-H", "-o", "value", "receive_resume_token", dataset]);
+    cmd.args(["get", "--json", "receive_resume_token", dataset]);
     match run(cmd) {
-        Ok(output) => Ok(parse_resume_token(output.trim())),
+        Ok(stdout) => Ok(map_token_value(decode_property_json(
+            &stdout,
+            "receive_resume_token",
+            dataset,
+        )?)),
         Err(e) if is_dataset_not_found(&e) => Ok(None),
         Err(e) => Err(e),
-    }
-}
-
-fn parse_resume_token(value: &str) -> Option<String> {
-    if value == "-" || value == "none" {
-        None
-    } else {
-        Some(value.to_owned())
     }
 }
 
@@ -226,9 +215,9 @@ fn parse_resume_token(value: &str) -> Option<String> {
 pub fn discover_datasets() -> Result<Vec<String>, ClientError> {
     log::trace!("zfs list (discovering zrb-managed datasets)");
     let mut cmd = Command::new("zfs");
-    cmd.args(["list", "-t", "snapshot", "-H", "-o", "name"]);
+    cmd.args(["list", "-t", "snapshot", "--json"]);
     let output = run(cmd)?;
-    Ok(parse_discovered_datasets(&output))
+    decode_discover_json(&output)
 }
 
 /// Return the `zrb:resume-since` user property for `dataset`, or `None` if unset.
@@ -241,21 +230,15 @@ pub fn discover_datasets() -> Result<Vec<String>, ClientError> {
 pub fn get_resume_since(dataset: &str) -> Result<Option<DateTime<Utc>>, ClientError> {
     log::trace!("zfs get zrb:resume-since {dataset}");
     let mut cmd = Command::new("zfs");
-    cmd.args(["get", "-H", "-o", "value", "zrb:resume-since", dataset]);
+    cmd.args(["get", "--json", "zrb:resume-since", dataset]);
     match run(cmd) {
-        Ok(output) => Ok(parse_resume_since(output.trim())),
+        Ok(stdout) => Ok(map_since_value(decode_property_json(
+            &stdout,
+            "zrb:resume-since",
+            dataset,
+        )?)),
         Err(e) if is_dataset_not_found(&e) => Ok(None),
         Err(e) => Err(e),
-    }
-}
-
-fn parse_resume_since(value: &str) -> Option<DateTime<Utc>> {
-    if value == "-" {
-        None
-    } else {
-        DateTime::parse_from_rfc3339(value)
-            .ok()
-            .map(|dt| dt.to_utc())
     }
 }
 
@@ -433,21 +416,49 @@ pub fn clear_resume_since(dataset: &str) -> Result<(), ClientError> {
     run(cmd).map(|_| ())
 }
 
-fn parse_discovered_datasets(output: &str) -> Vec<String> {
-    let mut datasets: Vec<String> = output
-        .lines()
-        .filter_map(|line| {
-            let (dataset, snapshot) = line.trim().split_once('@')?;
-            if snapshot.starts_with("zrb-") {
-                Some(dataset.to_owned())
-            } else {
-                None
-            }
+fn decode_list_json(stdout: &str) -> Result<Vec<String>, ClientError> {
+    let out: ZfsOutput = serde_json::from_str(stdout)?;
+    Ok(out.datasets.into_keys().collect())
+}
+
+fn decode_property_json(
+    stdout: &str,
+    property: &str,
+    dataset: &str,
+) -> Result<Option<String>, ClientError> {
+    let out: ZfsOutput = serde_json::from_str(stdout)?;
+    Ok(out
+        .datasets
+        .get(dataset)
+        .and_then(|d| d.properties.get(property))
+        .map(|p| p.value.clone()))
+}
+
+fn decode_discover_json(stdout: &str) -> Result<Vec<String>, ClientError> {
+    let out: ZfsOutput = serde_json::from_str(stdout)?;
+    let mut datasets: Vec<String> = out
+        .datasets
+        .into_keys()
+        .filter_map(|key| {
+            let (dataset, snap) = key.split_once('@')?;
+            snap.starts_with("zrb-").then(|| dataset.to_owned())
         })
         .collect();
+    datasets.sort_unstable();
     datasets.dedup();
-    datasets
+    Ok(datasets)
 }
+
+fn map_token_value(raw: Option<String>) -> Option<String> {
+    raw.filter(|v| v != "-" && v != "none")
+}
+
+fn map_since_value(raw: Option<String>) -> Option<DateTime<Utc>> {
+    raw.filter(|v| v != "-")
+        .and_then(|v| DateTime::parse_from_rfc3339(&v).ok())
+        .map(|dt| dt.to_utc())
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -468,46 +479,31 @@ mod tests {
     }
 
     #[test]
-    fn discover_empty_output_gives_empty_vec() {
-        assert_eq!(parse_discovered_datasets(""), Vec::<String>::new());
+    fn decode_list_json_empty_datasets_gives_empty_vec() {
+        let json = r#"{"datasets":{}}"#;
+        assert_eq!(decode_list_json(json).unwrap(), Vec::<String>::new());
     }
 
     #[test]
-    fn discover_non_zrb_snapshots_excluded() {
-        let out = "tank/home@manual-backup\ntank/data@nightly\n";
-        assert_eq!(parse_discovered_datasets(out), Vec::<String>::new());
+    fn decode_list_json_single_snapshot_returned() {
+        let json = r#"{"datasets":{"tank/home@zrb-2026-01-01T00:00:00Z":{"properties":{}}}}"#;
+        assert_eq!(
+            decode_list_json(json).unwrap(),
+            vec!["tank/home@zrb-2026-01-01T00:00:00Z"]
+        );
     }
 
     #[test]
-    fn discover_zrb_snapshots_returns_dataset() {
-        let out = "tank/home@zrb-2026-01-01T00:00:00Z\n";
-        assert_eq!(parse_discovered_datasets(out), vec!["tank/home"]);
-    }
-
-    #[test]
-    fn discover_multiple_snapshots_same_dataset_deduplicated() {
-        let out = "tank/home@zrb-2026-01-01T00:00:00Z\ntank/home@zrb-2026-01-02T00:00:00Z\n";
-        assert_eq!(parse_discovered_datasets(out), vec!["tank/home"]);
-    }
-
-    #[test]
-    fn discover_mix_of_zrb_and_non_zrb_includes_dataset() {
-        let out = "tank/home@manual\ntank/home@zrb-2026-01-01T00:00:00Z\n";
-        assert_eq!(parse_discovered_datasets(out), vec!["tank/home"]);
-    }
-
-    #[test]
-    fn list_output_empty_string_gives_empty_vec() {
-        assert_eq!(parse_list_output(""), Vec::<String>::new());
-    }
-
-    #[test]
-    fn list_output_parses_names() {
-        let out = "tank/home@zrb-2026-01-01T00:00:00Z\ntank/home@zrb-2026-01-02T00:00:00Z\n";
-        let got = parse_list_output(out);
+    fn decode_list_json_multiple_snapshots_all_returned() {
+        let json = r#"{"datasets":{
+            "tank/home@zrb-2026-01-02T00:00:00Z":{"properties":{}},
+            "tank/home@zrb-2026-01-01T00:00:00Z":{"properties":{}}
+        }}"#;
+        let mut got = decode_list_json(json).unwrap();
+        got.sort_unstable();
         assert_eq!(
             got,
-            [
+            vec![
                 "tank/home@zrb-2026-01-01T00:00:00Z",
                 "tank/home@zrb-2026-01-02T00:00:00Z"
             ]
@@ -515,38 +511,104 @@ mod tests {
     }
 
     #[test]
-    fn parse_resume_since_dash_is_none() {
-        assert_eq!(parse_resume_since("-"), None);
+    fn decode_discover_json_non_zrb_snapshot_excluded() {
+        let json =
+            r#"{"datasets":{"tank/home@manual-backup":{"properties":{}},"tank/data@nightly":{"properties":{}}}}"#;
+        assert_eq!(decode_discover_json(json).unwrap(), Vec::<String>::new());
     }
 
     #[test]
-    fn parse_resume_since_valid_rfc3339_parses() {
+    fn decode_discover_json_zrb_snapshot_returns_dataset() {
+        let json =
+            r#"{"datasets":{"tank/home@zrb-2026-01-01T00:00:00Z":{"properties":{}}}}"#;
+        assert_eq!(decode_discover_json(json).unwrap(), vec!["tank/home"]);
+    }
+
+    #[test]
+    fn decode_discover_json_multiple_snapshots_same_dataset_deduplicated() {
+        let json = r#"{"datasets":{
+            "tank/home@zrb-2026-01-01T00:00:00Z":{"properties":{}},
+            "tank/home@zrb-2026-01-02T00:00:00Z":{"properties":{}}
+        }}"#;
+        assert_eq!(decode_discover_json(json).unwrap(), vec!["tank/home"]);
+    }
+
+    #[test]
+    fn decode_discover_json_mix_returns_only_zrb_datasets() {
+        let json = r#"{"datasets":{
+            "tank/home@manual":{"properties":{}},
+            "tank/home@zrb-2026-01-01T00:00:00Z":{"properties":{}}
+        }}"#;
+        assert_eq!(decode_discover_json(json).unwrap(), vec!["tank/home"]);
+    }
+
+    #[test]
+    fn decode_property_json_present_returns_some() {
+        let json = r#"{"datasets":{"tank/data":{"properties":{"receive_resume_token":{"value":"1-abc"}}}}}"#;
+        assert_eq!(
+            decode_property_json(json, "receive_resume_token", "tank/data").unwrap(),
+            Some("1-abc".to_owned())
+        );
+    }
+
+    #[test]
+    fn decode_property_json_empty_datasets_returns_none() {
+        let json = r#"{"datasets":{}}"#;
+        assert_eq!(
+            decode_property_json(json, "receive_resume_token", "tank/data").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn decode_property_json_wrong_dataset_returns_none() {
+        let json = r#"{"datasets":{"tank/data":{"properties":{"receive_resume_token":{"value":"1-abc"}}}}}"#;
+        assert_eq!(
+            decode_property_json(json, "receive_resume_token", "tank/other").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn get_resume_token_none_string_maps_to_none() {
+        let json = r#"{"datasets":{"tank/data":{"properties":{"receive_resume_token":{"value":"none"}}}}}"#;
+        let raw = decode_property_json(json, "receive_resume_token", "tank/data").unwrap();
+        assert_eq!(map_token_value(raw), None);
+    }
+
+    #[test]
+    fn get_resume_token_dash_maps_to_none() {
+        let json = r#"{"datasets":{"tank/data":{"properties":{"receive_resume_token":{"value":"-"}}}}}"#;
+        let raw = decode_property_json(json, "receive_resume_token", "tank/data").unwrap();
+        assert_eq!(map_token_value(raw), None);
+    }
+
+    #[test]
+    fn get_resume_token_real_value_maps_to_some() {
+        let tok = "1-abcdef0123456789abcdef0123456789";
+        let json = format!(
+            r#"{{"datasets":{{"tank/data":{{"properties":{{"receive_resume_token":{{"value":"{tok}"}}}}}}}}}}"#
+        );
+        let raw = decode_property_json(&json, "receive_resume_token", "tank/data").unwrap();
+        assert_eq!(map_token_value(raw), Some(tok.to_owned()));
+    }
+
+    #[test]
+    fn get_resume_since_dash_maps_to_none() {
+        let json = r#"{"datasets":{"tank/data":{"properties":{"zrb:resume-since":{"value":"-"}}}}}"#;
+        let raw = decode_property_json(json, "zrb:resume-since", "tank/data").unwrap();
+        assert_eq!(map_since_value(raw), None);
+    }
+
+    #[test]
+    fn get_resume_since_valid_rfc3339_maps_to_datetime() {
         use chrono::Datelike;
-        let ts = parse_resume_since("2026-05-23T12:00:00Z").unwrap();
+        let json = r#"{"datasets":{"tank/data":{"properties":{"zrb:resume-since":{"value":"2026-05-23T12:00:00Z"}}}}}"#;
+        let raw = decode_property_json(json, "zrb:resume-since", "tank/data").unwrap();
+        let ts = map_since_value(raw).unwrap();
         assert_eq!(ts.year(), 2026);
         assert_eq!(ts.month(), 5);
         assert_eq!(ts.day(), 23);
-    }
-
-    #[test]
-    fn parse_resume_since_malformed_is_none() {
-        assert_eq!(parse_resume_since("not-a-timestamp"), None);
-    }
-
-    #[test]
-    fn resume_token_dash_is_none() {
-        assert_eq!(parse_resume_token("-"), None);
-    }
-
-    #[test]
-    fn resume_token_none_string_is_none() {
-        assert_eq!(parse_resume_token("none"), None);
-    }
-
-    #[test]
-    fn resume_token_real_value_is_some() {
-        let tok = "1-abcdef0123456789abcdef0123456789";
-        assert_eq!(parse_resume_token(tok), Some(tok.to_owned()));
     }
 
     #[test]

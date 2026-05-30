@@ -72,13 +72,16 @@ zfs allow -u <user> snapshot,send,hold,release,destroy,mount tank/home
 `snapshot` and `send` are required for `zrb send`; `hold` and `release` are required for Transfer Holds (protecting the last-sent snapshot from being pruned); `destroy,mount` is required for `zrb prune`.
 Instead of `send` you may grant `send:raw` to prevent encrypted datasets from being send unencrypted.
 
-### 3. Create a dedicated user on the Remote
+### 3. Create dedicated users on the Remote
+
+Two system users are needed: one exposed via SSH for receiving backups, one for running prune locally.
 
 ```sh
 useradd -r -m -s /bin/bash zfsbackup
+useradd -r -s /usr/sbin/nologin zfsbackup-prune
 ```
 
-Copy the public key to the Remote:
+Copy the public key to the SSH user on the Remote:
 
 ```sh
 ssh-copy-id -i ~/.ssh/id_zrb.pub zfsbackup@backup.example.com
@@ -97,11 +100,15 @@ The `--client` flag lists which client names this key is permitted to present. A
 
 ### 5. Grant ZFS permissions on the Remote
 
-Delegate only the necessary permissions to the `zfsbackup` user on the dataset subtree it will receive into:
+Delegate the necessary permissions to each user on the dataset subtree:
 
 ```sh
-zfs allow -u <user> receive:append,create,hold,release,destroy,mount backup/laptop
+zfs allow -u zfsbackup receive:append,create,hold,release backup/laptop
+zfs allow -u zfsbackup-prune destroy,mount backup/laptop
 ```
+
+Keeping `destroy` and `mount` in a dedicated prune user means the SSH-exposed `zfsbackup` account cannot delete
+snapshots — `zfs allow` enforces this at the OS level regardless of what `zrb` does.
 
 Keep the delegation as narrow as possible — per-dataset subtree, not the whole pool.
 
@@ -327,10 +334,18 @@ inputs = {
 }
 ```
 
-The module creates the `zrb` system user, writes `/etc/zrb/main/server.toml`, and adds a `ForceCommand`-restricted entry
-to the user's `authorized_keys` for each client that has a `publicKey` set. When `prune.onCalendar` is set, a
-`zrb-server-prune-<name>` systemd service and timer are generated. You still need to grant ZFS permissions
-imperatively.
+The module creates two system users: `zrb` (SSH server user, receives backups) and `zrb-prune` (prune user, destroys
+snapshots). It writes `/etc/zrb/main/server.toml` and adds a `ForceCommand`-restricted entry to the SSH user's
+`authorized_keys` for each client that has a `publicKey` set. When `prune.onCalendar` is set, a
+`zrb-server-prune-<name>` systemd service and timer are generated running as `zrb-prune`.
+
+You still need to grant ZFS permissions imperatively. Using the default user names (`user` and `prune.user` override
+them if changed):
+
+```sh
+zfs allow -u zrb receive,create,hold,release backup/laptop
+zfs allow -u zrb-prune destroy,mount backup/laptop
+```
 
 ### Client
 
@@ -472,6 +487,8 @@ the blast radius to the datasets that client is permitted to write.
 
 **ZFS delegation is the hard boundary** — `zfs allow` enforces at the OS level which datasets the backup user may
 receive into, regardless of what `zrb` does.
+
+**SSH user and prune user are separated** — the user invoked via SSH `ForceCommand` holds only `receive,create,hold,release`; it cannot destroy snapshots. Snapshot deletion (`destroy,mount`) is delegated exclusively to a separate prune user that is never reachable over SSH. A compromised SSH key therefore cannot wipe backup history.
 
 ## Snapshot naming
 
