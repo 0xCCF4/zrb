@@ -1,5 +1,6 @@
 pub mod config;
 pub mod ops;
+pub mod progress;
 pub mod protocol;
 pub mod retention;
 pub mod snapshot;

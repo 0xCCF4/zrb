@@ -2,27 +2,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use chrono::Utc;
-use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncWrite};
 
 use crate::config::ServerConfig;
-use crate::protocol::codec::{self, ServerHello, ServerStatus};
-use crate::snapshot::naming;
+use crate::protocol::codec::{self, ClientReady, ServerStatus};
+use crate::protocol::handshake;
 use crate::zfs::client as zfs;
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
-
-fn version_compatible(client: &str, server: &str) -> bool {
-    let parse = |v: &str| -> Option<(u64, u64)> {
-        let mut parts = v.splitn(3, '.');
-        let major = parts.next()?.parse().ok()?;
-        let minor = parts.next()?.parse().ok()?;
-        Some((major, minor))
-    };
-    match (parse(client), parse(server)) {
-        (Some(c), Some(s)) => c == s,
-        _ => false,
-    }
-}
 
 extern "C" fn handle_sighup(_: libc::c_int) {
     CANCEL.store(true, Ordering::Relaxed);
@@ -65,81 +52,15 @@ pub async fn run_server_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     output: &mut W,
     cancel: &AtomicBool,
 ) -> anyhow::Result<()> {
-    let request = codec::decode_client_hello(input)
-        .await
-        .context("reading ClientHello")?;
-
-    if !version_compatible(&request.version, env!("CARGO_PKG_VERSION")) {
-        codec::encode_server_status(
-            &ServerStatus {
-                ok: false,
-                message: format!(
-                    "version mismatch: client {}, server {}",
-                    request.version,
-                    env!("CARGO_PKG_VERSION")
-                ),
-            },
-            output,
-        )
-        .await?;
+    let Some(handshake::ServerHandshakeResult {
+        target,
+        zfs_receive_opts,
+    }) = handshake::server_handshake(config, permitted_clients, input, output).await?
+    else {
         return Ok(());
-    }
-    codec::encode_server_status(
-        &ServerStatus {
-            ok: true,
-            message: "ok".to_owned(),
-        },
-        output,
-    )
-    .await?;
+    };
 
-    if !permitted_clients.contains(&request.client_name.as_str()) {
-        codec::encode_server_status(
-            &ServerStatus {
-                ok: false,
-                message: format!("unknown client: {}", request.client_name),
-            },
-            output,
-        )
-        .await?;
-        return Ok(());
-    }
-
-    let client_cfg = config
-        .clients
-        .get(&request.client_name)
-        .context("client in permitted_clients but missing from config")?;
-    if !client_cfg.allow.contains(&request.target) {
-        codec::encode_server_status(
-            &ServerStatus {
-                ok: false,
-                message: format!("dataset not allowed: {}", request.target),
-            },
-            output,
-        )
-        .await?;
-        return Ok(());
-    }
-
-    let resume_token = zfs::get_resume_token(&request.target).context("checking resume token")?;
-
-    let raw_snaps = zfs::list_snapshots(&request.target).context("listing snapshots")?;
-    let mut zrb_snaps = naming::filter_zrb(&raw_snaps);
-    naming::sort_chronological(&mut zrb_snaps);
-    let head = zrb_snaps.into_iter().last();
-
-    codec::encode_server_hello(
-        &ServerHello {
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-            head,
-            resume_token,
-        },
-        output,
-    )
-    .await?;
-    output.flush().await?;
-
-    let ready = codec::decode_client_ready(input)
+    let ready: ClientReady = codec::decode_json(input)
         .await
         .context("reading ClientReady")?;
     if !ready.ok {
@@ -147,7 +68,7 @@ pub async fn run_server_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         return Ok(());
     }
 
-    let mut recv = zfs::receive(&request.target, &client_cfg.zfs_receive_opts)
+    let mut recv = zfs::receive(&target, &zfs_receive_opts)
         .context("spawning zfs receive")?;
 
     let stream_result = codec::read_stream_with_cancel(input, &mut recv.stdin, cancel).await;
@@ -156,14 +77,14 @@ pub async fn run_server_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         Ok(true) => {
             // SIGHUP: SSH session closed mid-transfer.
             let _ = recv.finish().await;
-            annotate_resume_if_needed(&request.target)?;
+            annotate_resume_if_needed(&target)?;
             log::info!("client disconnected mid-transfer; cleaned up");
             return Ok(());
         }
         Ok(false) => match recv.finish().await {
             Ok(()) => {
-                place_server_transfer_hold(&request.target);
-                codec::encode_server_status(
+                place_server_transfer_hold(&target);
+                codec::encode_json(
                     &ServerStatus {
                         ok: true,
                         message: "ok".to_owned(),
@@ -173,8 +94,8 @@ pub async fn run_server_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 .await?;
             }
             Err(e) => {
-                annotate_resume_if_needed(&request.target)?;
-                codec::encode_server_status(
+                annotate_resume_if_needed(&target)?;
+                codec::encode_json(
                     &ServerStatus {
                         ok: false,
                         message: e.to_string(),
@@ -186,9 +107,9 @@ pub async fn run_server_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         },
         Err(_) => {
             let recv_err = recv.finish().await.err();
-            annotate_resume_if_needed(&request.target)?;
+            annotate_resume_if_needed(&target)?;
             let message = recv_err.map_or_else(|| "stream error".to_owned(), |e| e.to_string());
-            codec::encode_server_status(&ServerStatus { ok: false, message }, output)
+            codec::encode_json(&ServerStatus { ok: false, message }, output)
                 .await?;
         }
     }
@@ -293,7 +214,7 @@ monthly_for_days = 730
             target: target.to_owned(),
         };
         let mut buf = Vec::new();
-        codec::encode_client_hello(&msg, &mut buf).await.unwrap();
+        codec::encode_json(&msg, &mut buf).await.unwrap();
         buf
     }
 
@@ -313,8 +234,8 @@ monthly_for_days = 730
         )
         .await
         .unwrap();
-        let status =
-            codec::decode_server_status(&mut tokio::io::BufReader::new(Cursor::new(&output)))
+        let status: ServerStatus =
+            codec::decode_json(&mut tokio::io::BufReader::new(Cursor::new(&output)))
                 .await
                 .unwrap();
         assert!(!status.ok);
@@ -341,8 +262,8 @@ monthly_for_days = 730
         )
         .await
         .unwrap();
-        let status =
-            codec::decode_server_status(&mut tokio::io::BufReader::new(Cursor::new(&output)))
+        let status: ServerStatus =
+            codec::decode_json(&mut tokio::io::BufReader::new(Cursor::new(&output)))
                 .await
                 .unwrap();
         assert!(!status.ok);
@@ -379,8 +300,8 @@ monthly_for_days = 730
         )
         .await;
         // First ServerStatus is the version gate — must be ok.
-        let status =
-            codec::decode_server_status(&mut tokio::io::BufReader::new(Cursor::new(&output)))
+        let status: ServerStatus =
+            codec::decode_json(&mut tokio::io::BufReader::new(Cursor::new(&output)))
                 .await
                 .unwrap();
         assert!(
@@ -392,8 +313,8 @@ monthly_for_days = 730
 
     async fn read_two_statuses(output: &[u8]) -> (ServerStatus, ServerStatus) {
         let mut cur = tokio::io::BufReader::new(Cursor::new(output));
-        let first = codec::decode_server_status(&mut cur).await.unwrap();
-        let second = codec::decode_server_status(&mut cur).await.unwrap();
+        let first: ServerStatus = codec::decode_json(&mut cur).await.unwrap();
+        let second: ServerStatus = codec::decode_json(&mut cur).await.unwrap();
         (first, second)
     }
 

@@ -19,7 +19,7 @@ use zrb::ops::list as ops_list;
 use zrb::ops::prune as ops_prune;
 use zrb::ops::send::send_on;
 use zrb::ops::server::run_server_on;
-use zrb::protocol::codec::{self, ClientHello, ClientReady};
+use zrb::protocol::codec::{self, ClientHello, ClientReady, ServerHello, ServerStatus};
 use zrb::retention::policy::RetentionConfig;
 use zrb::tui::SendEvent;
 use zrb::zfs::client as zfs_client;
@@ -137,7 +137,7 @@ fn partial_run_send(latest: &str, target_dataset: &str, client_name: &str, srv_c
         let (client_read, mut client_write) = tokio::io::split(client_half);
         let mut stc_buf = tokio::io::BufReader::new(client_read);
 
-        codec::encode_client_hello(
+        codec::encode_json(
             &ClientHello {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 client_name: client_name.to_owned(),
@@ -148,7 +148,7 @@ fn partial_run_send(latest: &str, target_dataset: &str, client_name: &str, srv_c
         .await
         .expect("encode ClientHello");
 
-        let version_status = codec::decode_server_status(&mut stc_buf)
+        let version_status: ServerStatus = codec::decode_json(&mut stc_buf)
             .await
             .expect("version ServerStatus");
         assert!(
@@ -156,7 +156,7 @@ fn partial_run_send(latest: &str, target_dataset: &str, client_name: &str, srv_c
             "version gate rejected: {}",
             version_status.message
         );
-        let hello = codec::decode_server_hello(&mut stc_buf)
+        let hello: ServerHello = codec::decode_json(&mut stc_buf)
             .await
             .expect("ServerHello");
         assert!(
@@ -164,7 +164,7 @@ fn partial_run_send(latest: &str, target_dataset: &str, client_name: &str, srv_c
             "fresh target has no resume token before interruption"
         );
 
-        codec::encode_client_ready(
+        codec::encode_json(
             &ClientReady {
                 ok: true,
                 message: "ok".to_owned(),

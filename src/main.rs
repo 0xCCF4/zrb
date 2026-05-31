@@ -239,9 +239,31 @@ async fn run() -> anyhow::Result<()> {
                 Some(remotes.iter().map(String::as_str).collect())
             };
 
+            // Compute row keys (dataset → remote) for progress tracking.
+            // filter_slice is Copy so it can be moved into nested closures.
+            let filter_slice: Option<&[&str]> = filter.as_deref();
+            let mut row_keys: Vec<String> = ds_refs
+                .iter()
+                .flat_map(|&ds| {
+                    cfg.datasets
+                        .get(ds)
+                        .into_iter()
+                        .flat_map(move |rt| {
+                            rt.keys()
+                                .filter(move |n| {
+                                    filter_slice.is_none_or(|f| f.contains(&n.as_str()))
+                                })
+                                .map(move |r| format!("{ds} \u{2192} {r}"))
+                        })
+                })
+                .collect();
+            row_keys.sort_unstable();
+
             // Safety: `isatty` is always safe to call with a valid fd.
-            let maybe_tui = if tui {
-                if unsafe { libc::isatty(libc::STDOUT_FILENO) } == 0 {
+            let is_tty = unsafe { libc::isatty(libc::STDOUT_FILENO) } != 0;
+
+            let (event_tx, progress_task, cancel_map) = if tui {
+                if !is_tty {
                     anyhow::bail!(
                         "--tui requires a controlling TTY; \
                          stdout is not a terminal (piped or redirected)"
@@ -273,32 +295,24 @@ async fn run() -> anyhow::Result<()> {
                     return Ok(());
                 }
 
-                let mut row_keys: Vec<String> = display_info
-                    .iter()
-                    .flat_map(|(ds, remotes)| {
-                        remotes.iter().map(move |r| format!("{ds} \u{2192} {r}"))
-                    })
-                    .collect();
-                row_keys.sort_unstable();
-
-                let cancel_map = zrb::tui::build_cancel_map(&row_keys);
-                let cancel_for_send: std::collections::HashMap<_, _> = cancel_map
+                let cancel_tokens = zrb::tui::build_cancel_map(&row_keys);
+                let cancel_for_send: std::collections::HashMap<_, _> = cancel_tokens
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
 
                 let (tx, rx) = tokio::sync::mpsc::channel(256);
-                let tui_task =
-                    tokio::spawn(zrb::tui::run_transfer(rx, row_keys, cancel_map));
+                let task = tokio::spawn(zrb::tui::run_transfer(rx, row_keys, cancel_tokens));
 
-                Some((tx, tui_task, cancel_for_send))
+                (Some(tx), Some(task), Some(cancel_for_send))
+            } else if is_tty {
+                let (tx, rx) = tokio::sync::mpsc::channel(256);
+                let task = tokio::spawn(zrb::progress::run_inline(rx, row_keys));
+                (Some(tx), Some(task), None)
             } else {
-                None
-            };
-
-            let (event_tx, tui_task, cancel_map) = match maybe_tui {
-                Some((tx, task, cancel)) => (Some(tx), Some(task), Some(cancel)),
-                None => (None, None, None),
+                let (tx, rx) = tokio::sync::mpsc::channel(256);
+                let task = tokio::spawn(zrb::progress::run_plain(rx));
+                (Some(tx), Some(task), None)
             };
 
             if resume {
@@ -313,7 +327,7 @@ async fn run() -> anyhow::Result<()> {
                 .await?;
             }
 
-            if let Some(task) = tui_task {
+            if let Some(task) = progress_task {
                 task.await??;
             }
 

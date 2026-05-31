@@ -10,7 +10,8 @@ use tokio::task::JoinSet;
 
 use crate::config::{RemoteConfig, RemoteTargets, SourceConfig};
 use crate::ops::{list as ops_list, snapshot as ops_snapshot};
-use crate::protocol::codec::{self, ClientHello, ClientReady, CodecError};
+use crate::protocol::codec::{self, ClientReady, CodecError, ServerStatus};
+use crate::protocol::handshake;
 use crate::ssh::transport;
 use crate::tui::SendEvent;
 use crate::zfs::{client as zfs, estimator};
@@ -22,8 +23,8 @@ use crate::zfs::{client as zfs, estimator};
 /// send is retained regardless of send outcome.
 ///
 /// # Errors
-/// Returns `Err` only on pre-send failures (snapshot creation or config lookup).
-/// Per-remote send errors are logged, not propagated.
+/// Returns `Err` on pre-send failures (snapshot creation or config lookup) or if
+/// any remote transfer fails.
 async fn send_one_dataset(
     dataset: String,
     config: SourceConfig,
@@ -45,10 +46,10 @@ async fn send_one_dataset(
             remote_filter.as_deref().map(|v| v.iter().map(String::as_str).collect());
         let tasks = collect_tasks(dataset_remotes, filter_refs.as_deref(), &config.remotes)?;
         dispatch_tasks(
-            &latest, &local_snaps, config.name(), &dataset, tasks,
+            &latest, &local_snaps, config.name(), tasks,
             sequential, false, event_tx, cancel_map.as_ref(),
         )
-        .await;
+        .await?;
         Ok(())
     }
     .await;
@@ -120,8 +121,8 @@ pub async fn send(
 /// (use `zrb send` instead to create a fresh snapshot).
 ///
 /// # Errors
-/// Returns `Err` if there are no local snapshots for a dataset, or on pre-send
-/// config failures. Per-remote errors are logged as warnings.
+/// Returns `Err` if there are no local snapshots for a dataset, on pre-send
+/// config failures, or if any remote transfer fails.
 async fn resume_one_dataset(
     dataset: String,
     config: SourceConfig,
@@ -147,10 +148,10 @@ async fn resume_one_dataset(
             remote_filter.as_deref().map(|v| v.iter().map(String::as_str).collect());
         let tasks = collect_tasks(dataset_remotes, filter_refs.as_deref(), &config.remotes)?;
         dispatch_tasks(
-            &newest, &local_snaps, config.name(), &dataset, tasks,
+            &newest, &local_snaps, config.name(), tasks,
             sequential, true, event_tx, cancel_map.as_ref(),
         )
-        .await;
+        .await?;
         Ok(())
     }
     .await;
@@ -214,6 +215,33 @@ pub async fn send_resume(
     Ok(())
 }
 
+/// All per-remote transfer parameters bundled for a single send or resume operation.
+struct SendContext {
+    latest: String,
+    local_snaps: Vec<String>,
+    remote_name: String,
+    remote_cfg: RemoteConfig,
+    target: String,
+    client_name: String,
+    event_tx: Option<Sender<SendEvent>>,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl SendContext {
+    fn row_key_for(latest: &str, remote_name: &str) -> String {
+        let dataset = latest.split_once('@').map_or(latest, |(d, _)| d);
+        format!("{dataset} \u{2192} {remote_name}")
+    }
+
+    fn row_key(&self) -> String {
+        Self::row_key_for(&self.latest, &self.remote_name)
+    }
+
+    fn dataset(&self) -> &str {
+        self.latest.split_once('@').map_or(&self.latest, |(d, _)| d)
+    }
+}
+
 /// Filter and clone remote config into owned `(remote_name, RemoteConfig, target)` triples.
 ///
 /// Owned data is needed so each spawned task can take ownership without borrowing
@@ -244,60 +272,58 @@ async fn dispatch_tasks(
     latest: &str,
     local_snaps: &[String],
     client_name: &str,
-    dataset: &str,
     tasks: Vec<(String, RemoteConfig, String)>,
     sequential: bool,
     is_resume: bool,
     event_tx: Option<Sender<SendEvent>>,
     cancel_map: Option<&CancelMap>,
-) {
+) -> anyhow::Result<()> {
+    let mut any_failed = false;
     if sequential {
-        for (remote_name, remote_cfg, target) in &tasks {
-            let row_key = format!("{dataset} \u{2192} {remote_name}");
+        for (remote_name, remote_cfg, target) in tasks {
+            let row_key = SendContext::row_key_for(latest, &remote_name);
             let cancel = cancel_map.and_then(|m| m.get(&row_key)).cloned();
+            let ctx = SendContext {
+                latest: latest.to_owned(),
+                local_snaps: local_snaps.to_vec(),
+                client_name: client_name.to_owned(),
+                remote_name,
+                remote_cfg,
+                target,
+                event_tx: event_tx.clone(),
+                cancel,
+            };
             let result = if is_resume {
-                resume_to_remote(
-                    latest, local_snaps, remote_name, remote_cfg, target, client_name,
-                    &row_key, event_tx.clone(), cancel,
-                )
-                .await
+                resume_to_remote(ctx).await
             } else {
-                send_to_remote(
-                    latest, local_snaps, remote_name, remote_cfg, target, client_name,
-                    &row_key, event_tx.clone(), cancel,
-                )
-                .await
+                send_to_remote(ctx).await
             };
             if let Err(e) = result && !is_cancelled(&e) {
                 let verb = if is_resume { "resume" } else { "send" };
                 log::warn!("{verb} {row_key}: {e:#}");
+                any_failed = true;
             }
         }
     } else {
         let mut set: JoinSet<(String, anyhow::Result<()>)> = JoinSet::new();
         for (remote_name, remote_cfg, target) in tasks {
-            let (latest, local_snaps, cname, ds) = (
-                latest.to_owned(),
-                local_snaps.to_vec(),
-                client_name.to_owned(),
-                dataset.to_owned(),
-            );
-            let row_key = format!("{ds} \u{2192} {remote_name}");
-            let tx = event_tx.clone();
+            let row_key = SendContext::row_key_for(latest, &remote_name);
             let cancel = cancel_map.and_then(|m| m.get(&row_key)).cloned();
+            let ctx = SendContext {
+                latest: latest.to_owned(),
+                local_snaps: local_snaps.to_vec(),
+                client_name: client_name.to_owned(),
+                remote_name,
+                remote_cfg,
+                target,
+                event_tx: event_tx.clone(),
+                cancel,
+            };
             set.spawn(async move {
                 let result = if is_resume {
-                    resume_to_remote(
-                        &latest, &local_snaps, &remote_name, &remote_cfg, &target, &cname,
-                        &row_key, tx, cancel,
-                    )
-                    .await
+                    resume_to_remote(ctx).await
                 } else {
-                    send_to_remote(
-                        &latest, &local_snaps, &remote_name, &remote_cfg, &target, &cname,
-                        &row_key, tx, cancel,
-                    )
-                    .await
+                    send_to_remote(ctx).await
                 };
                 (row_key, result)
             });
@@ -306,40 +332,28 @@ async fn dispatch_tasks(
             if let Ok((row_key, Err(e))) = joined && !is_cancelled(&e) {
                 let verb = if is_resume { "resume" } else { "send" };
                 log::warn!("{verb} {row_key}: {e:#}");
+                any_failed = true;
             }
         }
     }
+    if any_failed {
+        anyhow::bail!("one or more remotes failed");
+    }
+    Ok(())
 }
 
-#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
-async fn send_to_remote(
-    latest: &str,
-    local_snaps: &[String],
-    remote_name: &str,
-    remote_cfg: &RemoteConfig,
-    target: &str,
-    client_name: &str,
-    row_key: &str,
-    event_tx: Option<Sender<SendEvent>>,
-    cancel: Option<tokio_util::sync::CancellationToken>,
-) -> anyhow::Result<()> {
+#[allow(clippy::cast_precision_loss)]
+async fn send_to_remote(ctx: SendContext) -> anyhow::Result<()> {
+    let row_key = ctx.row_key();
     let start = std::time::Instant::now();
-    let dataset = latest.split_once('@').map_or(latest, |(d, _)| d);
+    let dataset = ctx.dataset().to_owned();
 
-    let mut conn = transport::connect(remote_cfg, &[])?;
+    let mut conn = transport::connect(&ctx.remote_cfg, &[])?;
     let mut reader = tokio::io::BufReader::new(conn.stdout);
 
     let result = send_on(
-        latest,
-        local_snaps,
-        remote_cfg,
-        target,
-        client_name,
-        &mut reader,
-        &mut conn.stdin,
-        row_key,
-        event_tx.clone(),
-        cancel.as_ref(),
+        &ctx.latest, &ctx.local_snaps, &ctx.remote_cfg, &ctx.target, &ctx.client_name,
+        &mut reader, &mut conn.stdin, &row_key, ctx.event_tx.clone(), ctx.cancel.as_ref(),
     )
     .await;
 
@@ -349,44 +363,33 @@ async fn send_to_remote(
     let elapsed_s = start.elapsed().as_secs_f64();
     match result {
         Ok(bytes) => {
-            place_transfer_hold(dataset, latest, remote_name);
-            #[allow(clippy::cast_precision_loss)]
+            place_transfer_hold(&dataset, &ctx.latest, &ctx.remote_name);
             let rate_mbs = if elapsed_s > 0.0 {
                 bytes as f64 / 1_000_000.0 / elapsed_s
             } else {
                 0.0
             };
-            log::info!(
-                "sent {dataset}: {bytes} bytes in {elapsed_s:.1}s ({rate_mbs:.2} MB/s)"
-            );
-            if let Some(ref tx) = event_tx {
-                let _ = tx
-                    .send(SendEvent::RemoteCompleted {
-                        remote: row_key.to_owned(),
-                        elapsed_secs: elapsed_s,
-                        bytes,
-                    })
-                    .await;
+            log::info!("sent {dataset}: {bytes} bytes in {elapsed_s:.1}s ({rate_mbs:.2} MB/s)");
+            if let Some(ref tx) = ctx.event_tx {
+                let _ = tx.send(SendEvent::RemoteCompleted {
+                    remote: row_key,
+                    elapsed_secs: elapsed_s,
+                    bytes,
+                }).await;
             }
             Ok(())
         }
         Err(e) => {
             if is_cancelled(&e) {
-                log::debug!("send {dataset} -> {remote_name}: cancelled by user");
-                if let Some(ref tx) = event_tx {
-                    let _ = tx
-                        .send(SendEvent::RemoteSkipped {
-                            remote: row_key.to_owned(),
-                        })
-                        .await;
+                log::debug!("send {dataset} -> {}: cancelled by user", ctx.remote_name);
+                if let Some(ref tx) = ctx.event_tx {
+                    let _ = tx.send(SendEvent::RemoteSkipped { remote: row_key }).await;
                 }
-            } else if let Some(ref tx) = event_tx {
-                let _ = tx
-                    .send(SendEvent::RemoteFailed {
-                        remote: row_key.to_owned(),
-                        error: e.to_string(),
-                    })
-                    .await;
+            } else if let Some(ref tx) = ctx.event_tx {
+                let _ = tx.send(SendEvent::RemoteFailed {
+                    remote: row_key,
+                    error: e.to_string(),
+                }).await;
             }
             Err(e)
         }
@@ -398,35 +401,18 @@ fn is_cancelled(e: &anyhow::Error) -> bool {
         .is_some_and(|c| matches!(c, CodecError::Cancelled))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn resume_to_remote(
-    latest: &str,
-    local_snaps: &[String],
-    remote_name: &str,
-    remote_cfg: &RemoteConfig,
-    target: &str,
-    client_name: &str,
-    row_key: &str,
-    event_tx: Option<Sender<SendEvent>>,
-    cancel: Option<tokio_util::sync::CancellationToken>,
-) -> anyhow::Result<()> {
+#[allow(clippy::cast_precision_loss)]
+async fn resume_to_remote(ctx: SendContext) -> anyhow::Result<()> {
+    let row_key = ctx.row_key();
     let start = std::time::Instant::now();
-    let dataset = latest.split_once('@').map_or(latest, |(d, _)| d);
+    let dataset = ctx.dataset().to_owned();
 
-    let mut conn = transport::connect(remote_cfg, &[])?;
+    let mut conn = transport::connect(&ctx.remote_cfg, &[])?;
     let mut reader = tokio::io::BufReader::new(conn.stdout);
 
     let result = resume_on(
-        latest,
-        local_snaps,
-        remote_cfg,
-        target,
-        client_name,
-        &mut reader,
-        &mut conn.stdin,
-        row_key,
-        event_tx.clone(),
-        cancel.as_ref(),
+        &ctx.latest, &ctx.local_snaps, &ctx.remote_cfg, &ctx.target, &ctx.client_name,
+        &mut reader, &mut conn.stdin, &row_key, ctx.event_tx.clone(), ctx.cancel.as_ref(),
     )
     .await;
 
@@ -436,48 +422,46 @@ async fn resume_to_remote(
     let elapsed_s = start.elapsed().as_secs_f64();
     match result {
         Ok(bytes) => {
-            place_transfer_hold(dataset, latest, remote_name);
-            #[allow(clippy::cast_precision_loss)]
+            place_transfer_hold(&dataset, &ctx.latest, &ctx.remote_name);
             let rate_mbs = if elapsed_s > 0.0 {
                 bytes as f64 / 1_000_000.0 / elapsed_s
             } else {
                 0.0
             };
-            log::info!(
-                "resumed {dataset}: {bytes} bytes in {elapsed_s:.1}s ({rate_mbs:.2} MB/s)"
-            );
-            if let Some(ref tx) = event_tx {
-                let _ = tx
-                    .send(SendEvent::RemoteCompleted {
-                        remote: row_key.to_owned(),
-                        elapsed_secs: elapsed_s,
-                        bytes,
-                    })
-                    .await;
+            log::info!("resumed {dataset}: {bytes} bytes in {elapsed_s:.1}s ({rate_mbs:.2} MB/s)");
+            if let Some(ref tx) = ctx.event_tx {
+                let _ = tx.send(SendEvent::RemoteCompleted {
+                    remote: row_key,
+                    elapsed_secs: elapsed_s,
+                    bytes,
+                }).await;
             }
             Ok(())
         }
         Err(e) => {
             if is_cancelled(&e) {
-                log::debug!("resume {dataset} -> {remote_name}: cancelled by user");
-                if let Some(ref tx) = event_tx {
-                    let _ = tx
-                        .send(SendEvent::RemoteSkipped {
-                            remote: row_key.to_owned(),
-                        })
-                        .await;
+                log::debug!("resume {dataset} -> {}: cancelled by user", ctx.remote_name);
+                if let Some(ref tx) = ctx.event_tx {
+                    let _ = tx.send(SendEvent::RemoteSkipped { remote: row_key }).await;
                 }
-            } else if let Some(ref tx) = event_tx {
-                let _ = tx
-                    .send(SendEvent::RemoteFailed {
-                        remote: row_key.to_owned(),
-                        error: e.to_string(),
-                    })
-                    .await;
+            } else if let Some(ref tx) = ctx.event_tx {
+                let _ = tx.send(SendEvent::RemoteFailed {
+                    remote: row_key,
+                    error: e.to_string(),
+                }).await;
             }
             Err(e)
         }
     }
+}
+
+/// Whether to check for "already on server" before attempting an incremental send.
+#[derive(PartialEq, Eq)]
+enum SendMode {
+    /// Fresh send — create a new snapshot, no "already on server" check.
+    New,
+    /// Resume — error if the latest snapshot is already on the server.
+    Resume,
 }
 
 /// Run the send protocol over arbitrary async `Read`/`Write` streams.
@@ -491,7 +475,7 @@ async fn resume_to_remote(
 ///
 /// # Errors
 /// Returns `Err` on I/O, codec, or remote protocol failure.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub async fn send_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     latest: &str,
     local_snaps: &[String],
@@ -504,135 +488,11 @@ pub async fn send_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     event_tx: Option<Sender<SendEvent>>,
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> anyhow::Result<u64> {
-    codec::encode_client_hello(
-        &ClientHello {
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-            client_name: client_name.to_owned(),
-            target: target.to_owned(),
-        },
-        writer,
+    run_protocol_on(
+        latest, local_snaps, remote_cfg, target, client_name,
+        reader, writer, row_key, event_tx, cancel, SendMode::New,
     )
     .await
-    .context("writing ClientHello")?;
-
-    let version_status = codec::decode_server_status(reader)
-        .await
-        .context("reading version ServerStatus")?;
-    if !version_status.ok {
-        anyhow::bail!("server rejected connection: {}", version_status.message);
-    }
-
-    let hello = codec::decode_server_hello(reader)
-        .await
-        .context("reading ServerHello")?;
-
-    log::debug!("server head: {:?}", hello.head);
-
-    let stream_res: anyhow::Result<_> = if let Some(ref token) = hello.resume_token {
-        log::debug!("resume token present; using zfs send -t");
-        let size = estimate_resume_size(token, &remote_cfg.zfs_send_opts).await;
-        zfs::send_resume(token, &remote_cfg.zfs_send_opts)
-            .context("zfs send -t")
-            .map(|out| (out, size))
-    } else {
-        match select_incremental_base(local_snaps, hello.head.as_deref())
-            .context("selecting incremental base")
-        {
-            Ok(base) => {
-                match base {
-                    Some(b) => log::debug!("incremental base: {b}"),
-                    None => log::debug!("no server snapshots; sending full stream"),
-                }
-                let estimate = estimate_size(base, latest, &remote_cfg.zfs_send_opts)
-                    .await
-                    .unwrap_or(0);
-                zfs::send_incremental(base, latest, &remote_cfg.zfs_send_opts)
-                    .context("zfs send")
-                    .map(|out| (out, estimate))
-            }
-            Err(e) => Err(e),
-        }
-    };
-
-    let (mut zfs_out, total_bytes) = match stream_res {
-        Ok(pair) => {
-            codec::encode_client_ready(
-                &ClientReady {
-                    ok: true,
-                    message: "ok".to_owned(),
-                },
-                writer,
-            )
-            .await
-            .context("writing ClientReady")?;
-            pair
-        }
-        Err(e) => {
-            let _ = codec::encode_client_ready(
-                &ClientReady {
-                    ok: false,
-                    message: e.to_string(),
-                },
-                writer,
-            )
-            .await;
-            return Err(e);
-        }
-    };
-
-    if let Some(ref tx) = event_tx {
-        let _ = tx
-            .send(SendEvent::RemoteStarted {
-                remote: row_key.to_owned(),
-                total_bytes,
-            })
-            .await;
-    }
-
-    let mut bytes_sent: u64 = 0;
-    {
-        let bs = &mut bytes_sent;
-        let rk = row_key.to_owned();
-        let etx = event_tx;
-        let cb: &mut (dyn FnMut(u64, u64) + Send) = &mut move |b: u64, _total: u64| {
-            *bs = b;
-            let _ = sd_notify::notify(&[NotifyState::Watchdog]);
-            if let Some(ref tx) = etx {
-                let _ = tx.try_send(SendEvent::RemoteProgress {
-                    remote: rk.clone(),
-                    bytes_sent: b,
-                });
-            }
-        };
-        if let Err(e) = codec::write_stream(
-            &mut zfs_out,
-            writer,
-            remote_cfg.bandwidth_limit,
-            total_bytes,
-            Some(cb),
-            cancel,
-        )
-        .await
-        {
-            if !matches!(e, codec::CodecError::Cancelled)
-                && let Ok(status) = codec::decode_server_status(reader).await
-                && !status.ok
-            {
-                return Err(remote_receive_error(&status.message));
-            }
-            return Err(e).context("transferring stream");
-        }
-    }
-
-    let status = codec::decode_server_status(reader)
-        .await
-        .context("reading ServerStatus")?;
-
-    if status.ok {
-        Ok(bytes_sent)
-    } else {
-        Err(remote_receive_error(&status.message))
-    }
 }
 
 /// Run the resume protocol over arbitrary async `Read`/`Write` streams.
@@ -646,7 +506,7 @@ pub async fn send_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
 /// # Errors
 /// Returns `Err` on I/O, codec, remote protocol failure, or if the newest
 /// snapshot is already present on the Remote.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     latest: &str,
     local_snaps: &[String],
@@ -659,27 +519,29 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     event_tx: Option<Sender<SendEvent>>,
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> anyhow::Result<u64> {
-    codec::encode_client_hello(
-        &ClientHello {
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-            client_name: client_name.to_owned(),
-            target: target.to_owned(),
-        },
-        writer,
+    run_protocol_on(
+        latest, local_snaps, remote_cfg, target, client_name,
+        reader, writer, row_key, event_tx, cancel, SendMode::Resume,
     )
     .await
-    .context("writing ClientHello")?;
+}
 
-    let version_status = codec::decode_server_status(reader)
-        .await
-        .context("reading version ServerStatus")?;
-    if !version_status.ok {
-        anyhow::bail!("server rejected connection: {}", version_status.message);
-    }
-
-    let hello = codec::decode_server_hello(reader)
-        .await
-        .context("reading ServerHello")?;
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_protocol_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+    latest: &str,
+    local_snaps: &[String],
+    remote_cfg: &RemoteConfig,
+    target: &str,
+    client_name: &str,
+    reader: &mut R,
+    writer: &mut W,
+    row_key: &str,
+    event_tx: Option<Sender<SendEvent>>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    mode: SendMode,
+) -> anyhow::Result<u64> {
+    let handshake::ClientHandshakeResult { hello } =
+        handshake::client_handshake(reader, writer, target, client_name).await?;
 
     log::debug!("server head: {:?}", hello.head);
 
@@ -690,13 +552,17 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             .context("zfs send -t")
             .map(|out| (out, size))
     } else {
-        let latest_suffix = latest.split_once('@').map_or(latest, |(_, n)| n);
-        let on_server = hello
-            .head
-            .as_deref()
-            .and_then(|h| h.split_once('@'))
-            .is_some_and(|(_, n)| n == latest_suffix);
-        if on_server {
+        let already_on_server = if mode == SendMode::Resume {
+            let latest_suffix = latest.split_once('@').map_or(latest, |(_, n)| n);
+            hello
+                .head
+                .as_deref()
+                .and_then(|h| h.split_once('@'))
+                .is_some_and(|(_, n)| n == latest_suffix)
+        } else {
+            false
+        };
+        if already_on_server {
             Err(anyhow::anyhow!(
                 "newest snapshot already on server; run `zrb send` to create a fresh backup"
             ))
@@ -723,7 +589,7 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
 
     let (mut zfs_out, total_bytes) = match stream_res {
         Ok(pair) => {
-            codec::encode_client_ready(
+            codec::encode_json(
                 &ClientReady {
                     ok: true,
                     message: "ok".to_owned(),
@@ -735,7 +601,7 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             pair
         }
         Err(e) => {
-            let _ = codec::encode_client_ready(
+            let _ = codec::encode_json(
                 &ClientReady {
                     ok: false,
                     message: e.to_string(),
@@ -782,7 +648,7 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         .await
         {
             if !matches!(e, codec::CodecError::Cancelled)
-                && let Ok(status) = codec::decode_server_status(reader).await
+                && let Ok(status) = codec::decode_json::<ServerStatus, _>(reader).await
                 && !status.ok
             {
                 return Err(remote_receive_error(&status.message));
@@ -791,7 +657,7 @@ pub async fn resume_on<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         }
     }
 
-    let status = codec::decode_server_status(reader)
+    let status: ServerStatus = codec::decode_json(reader)
         .await
         .context("reading ServerStatus")?;
 
@@ -919,7 +785,7 @@ mod tests {
     use std::io::Cursor;
 
     use crate::config::RemoteConfig;
-    use crate::protocol::codec::{self, ServerHello, ServerStatus};
+    use crate::protocol::codec::{self, ClientHello, ClientReady, ServerHello, ServerStatus};
 
     fn test_remote_cfg() -> RemoteConfig {
         RemoteConfig {
@@ -935,8 +801,8 @@ mod tests {
 
     async fn version_ok_then_hello(hello: &ServerHello) -> Vec<u8> {
         let mut buf = Vec::new();
-        codec::encode_server_status(
-            &crate::protocol::codec::ServerStatus {
+        codec::encode_json(
+            &ServerStatus {
                 ok: true,
                 message: "ok".to_owned(),
             },
@@ -944,7 +810,7 @@ mod tests {
         )
         .await
         .unwrap();
-        codec::encode_server_hello(hello, &mut buf).await.unwrap();
+        codec::encode_json(hello, &mut buf).await.unwrap();
         buf
     }
 
@@ -1043,8 +909,8 @@ mod tests {
         .await;
 
         let mut r = tokio::io::BufReader::new(Cursor::new(&writer));
-        let _: codec::ClientHello = codec::decode_client_hello(&mut r).await.unwrap();
-        let ready = codec::decode_client_ready(&mut r).await.unwrap();
+        let _: ClientHello = codec::decode_json(&mut r).await.unwrap();
+        let ready: ClientReady = codec::decode_json(&mut r).await.unwrap();
         assert!(!ready.ok, "expected ClientReady.ok=false, got ok=true");
         assert!(
             ready.message.contains("already on server"),
@@ -1055,7 +921,7 @@ mod tests {
 
     async fn version_rejection_bytes(message: &str) -> Vec<u8> {
         let mut buf = Vec::new();
-        codec::encode_server_status(
+        codec::encode_json(
             &ServerStatus {
                 ok: false,
                 message: message.to_owned(),

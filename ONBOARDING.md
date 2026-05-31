@@ -77,7 +77,8 @@ src/
 ├── snapshot/        — snapshot naming (zrb- prefix + UTC timestamp)
 ├── retention/       — RetentionPolicy; decides which snapshots to delete
 ├── protocol/        — wire types (ClientHello, ServerHello, ServerStatus, ClientReady, Chunk, ControlFrame)
-│   └── codec.rs     — JSON + binary framing; read/write helpers
+│   ├── codec.rs     — JSON framing (encode_json/decode_json) and binary chunk/control-frame framing
+│   └── handshake.rs — Protocol handshake sequence: client_handshake() and server_handshake()
 ├── zfs/             — thin wrappers around zfs(8) and zpool(8) subprocesses
 │   ├── client.rs    — zfs list, zfs send, zfs receive, zfs destroy
 │   └── estimator.rs — zfs send -n -v for incremental-base selection

@@ -47,73 +47,7 @@ pub enum CodecError {
 
 /// # Errors
 /// Returns `CodecError` on I/O or JSON serialization failure.
-pub async fn encode_server_hello<W: AsyncWrite + Unpin>(
-    msg: &ServerHello,
-    dest: &mut W,
-) -> Result<(), CodecError> {
-    encode_json(msg, dest).await
-}
-
-/// # Errors
-/// Returns `CodecError` on I/O or JSON deserialization failure.
-pub async fn decode_server_hello<R: AsyncBufRead + Unpin>(
-    src: &mut R,
-) -> Result<ServerHello, CodecError> {
-    decode_json(src).await
-}
-
-/// # Errors
-/// Returns `CodecError` on I/O or JSON serialization failure.
-pub async fn encode_client_hello<W: AsyncWrite + Unpin>(
-    msg: &ClientHello,
-    dest: &mut W,
-) -> Result<(), CodecError> {
-    encode_json(msg, dest).await
-}
-
-/// # Errors
-/// Returns `CodecError` on I/O or JSON deserialization failure.
-pub async fn decode_client_hello<R: AsyncBufRead + Unpin>(
-    src: &mut R,
-) -> Result<ClientHello, CodecError> {
-    decode_json(src).await
-}
-
-/// # Errors
-/// Returns `CodecError` on I/O or JSON serialization failure.
-pub async fn encode_server_status<W: AsyncWrite + Unpin>(
-    msg: &ServerStatus,
-    dest: &mut W,
-) -> Result<(), CodecError> {
-    encode_json(msg, dest).await
-}
-
-/// # Errors
-/// Returns `CodecError` on I/O or JSON deserialization failure.
-pub async fn decode_server_status<R: AsyncBufRead + Unpin>(
-    src: &mut R,
-) -> Result<ServerStatus, CodecError> {
-    decode_json(src).await
-}
-
-/// # Errors
-/// Returns `CodecError` on I/O or JSON serialization failure.
-pub async fn encode_client_ready<W: AsyncWrite + Unpin>(
-    msg: &ClientReady,
-    dest: &mut W,
-) -> Result<(), CodecError> {
-    encode_json(msg, dest).await
-}
-
-/// # Errors
-/// Returns `CodecError` on I/O or JSON deserialization failure.
-pub async fn decode_client_ready<R: AsyncBufRead + Unpin>(
-    src: &mut R,
-) -> Result<ClientReady, CodecError> {
-    decode_json(src).await
-}
-
-async fn encode_json<T: Serialize, W: AsyncWrite + Unpin>(
+pub async fn encode_json<T: Serialize, W: AsyncWrite + Unpin>(
     msg: &T,
     dest: &mut W,
 ) -> Result<(), CodecError> {
@@ -123,7 +57,9 @@ async fn encode_json<T: Serialize, W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn decode_json<T: for<'de> Deserialize<'de>, R: AsyncBufRead + Unpin>(
+/// # Errors
+/// Returns `CodecError` on I/O or JSON deserialization failure.
+pub async fn decode_json<T: for<'de> Deserialize<'de>, R: AsyncBufRead + Unpin>(
     src: &mut R,
 ) -> Result<T, CodecError> {
     let mut line = String::new();
@@ -292,10 +228,11 @@ mod tests {
             message: "ok".to_string(),
         };
         let mut buf = Vec::new();
-        encode_client_ready(&msg, &mut buf).await.unwrap();
-        let decoded = decode_client_ready(&mut tokio::io::BufReader::new(Cursor::new(&buf)))
-            .await
-            .unwrap();
+        encode_json(&msg, &mut buf).await.unwrap();
+        let decoded: ClientReady =
+            decode_json(&mut tokio::io::BufReader::new(Cursor::new(&buf)))
+                .await
+                .unwrap();
         assert_eq!(decoded, msg);
     }
 
@@ -306,10 +243,11 @@ mod tests {
             message: "newest snapshot already on server".to_string(),
         };
         let mut buf = Vec::new();
-        encode_client_ready(&msg, &mut buf).await.unwrap();
-        let decoded = decode_client_ready(&mut tokio::io::BufReader::new(Cursor::new(&buf)))
-            .await
-            .unwrap();
+        encode_json(&msg, &mut buf).await.unwrap();
+        let decoded: ClientReady =
+            decode_json(&mut tokio::io::BufReader::new(Cursor::new(&buf)))
+                .await
+                .unwrap();
         assert_eq!(decoded, msg);
     }
 
@@ -321,10 +259,11 @@ mod tests {
             resume_token: Some("opaque-token".to_string()),
         };
         let mut buf = Vec::new();
-        encode_server_hello(&msg, &mut buf).await.unwrap();
-        let decoded = decode_server_hello(&mut tokio::io::BufReader::new(Cursor::new(&buf)))
-            .await
-            .unwrap();
+        encode_json(&msg, &mut buf).await.unwrap();
+        let decoded: ServerHello =
+            decode_json(&mut tokio::io::BufReader::new(Cursor::new(&buf)))
+                .await
+                .unwrap();
         assert_eq!(decoded, msg);
     }
 
@@ -336,10 +275,11 @@ mod tests {
             resume_token: None,
         };
         let mut buf = Vec::new();
-        encode_server_hello(&msg, &mut buf).await.unwrap();
-        let decoded = decode_server_hello(&mut tokio::io::BufReader::new(Cursor::new(&buf)))
-            .await
-            .unwrap();
+        encode_json(&msg, &mut buf).await.unwrap();
+        let decoded: ServerHello =
+            decode_json(&mut tokio::io::BufReader::new(Cursor::new(&buf)))
+                .await
+                .unwrap();
         assert_eq!(decoded, msg);
     }
 
@@ -351,10 +291,11 @@ mod tests {
             target: "backup/laptop/home".to_string(),
         };
         let mut buf = Vec::new();
-        encode_client_hello(&msg, &mut buf).await.unwrap();
-        let decoded = decode_client_hello(&mut tokio::io::BufReader::new(Cursor::new(&buf)))
-            .await
-            .unwrap();
+        encode_json(&msg, &mut buf).await.unwrap();
+        let decoded: ClientHello =
+            decode_json(&mut tokio::io::BufReader::new(Cursor::new(&buf)))
+                .await
+                .unwrap();
         assert_eq!(decoded, msg);
     }
 
@@ -365,10 +306,11 @@ mod tests {
             message: "dataset not allowed".to_string(),
         };
         let mut buf = Vec::new();
-        encode_server_status(&msg, &mut buf).await.unwrap();
-        let decoded = decode_server_status(&mut tokio::io::BufReader::new(Cursor::new(&buf)))
-            .await
-            .unwrap();
+        encode_json(&msg, &mut buf).await.unwrap();
+        let decoded: ServerStatus =
+            decode_json(&mut tokio::io::BufReader::new(Cursor::new(&buf)))
+                .await
+                .unwrap();
         assert_eq!(decoded, msg);
     }
 

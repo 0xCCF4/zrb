@@ -18,13 +18,13 @@ pub struct PruneResult {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ResumeDecision {
+enum ResumeDecision {
     Idle,   // no token; clear any stale since property
     Wait,   // token present, hold period not yet elapsed; skip snapshot pruning
     Expire, // token present, hold period elapsed; abort
 }
 
-pub(crate) fn resume_decision(
+fn resume_decision(
     has_token: bool,
     since: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
