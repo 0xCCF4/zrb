@@ -214,6 +214,7 @@ in
     systemd.services = mkMerge [
       (mapAttrs'
         (name: job:
+          let datasets = concatStringsSep " " job.datasets; in
           nameValuePair "zrb-send-${name}" {
             description = "zrb send job '${name}'";
             after = [ "network-online.target" ];
@@ -221,9 +222,9 @@ in
             serviceConfig = {
               Type = "notify";
               User = cfg.user;
+              ExecStartPre = "${cfg.package}/bin/zrb snapshot --config /etc/zrb/client.toml ${datasets}";
               ExecStart = concatStringsSep " " (
-                [ "${cfg.package}/bin/zrb" "send" "--config" "/etc/zrb/client.toml" ]
-                  ++ job.datasets
+                [ "${cfg.package}/bin/zrb" "send" "--config" "/etc/zrb/client.toml" datasets ]
                   ++ concatMap (r: [ "--remote" r ]) job.remotes
               );
             } // optionalAttrs (job.watchdogSec != null) {

@@ -377,6 +377,11 @@ let
       (lib.elem "network-online.target" clientCfg.systemd.services."zrb-send-hourly".after)
       "zrb-send-hourly service missing After=network-online.target")
 
+    # Client: zrb-send-hourly has ExecStartPre running snapshot for the job's datasets
+    (lib.assertMsg
+      (lib.hasInfix "snapshot --config" clientCfg.systemd.services."zrb-send-hourly".serviceConfig.ExecStartPre)
+      "zrb-send-hourly ExecStartPre does not contain \"snapshot --config\"")
+
     # Client: jobs.hourly produces zrb-send-hourly timer
     (lib.assertMsg
       (clientCfg.systemd.timers ? "zrb-send-hourly")
