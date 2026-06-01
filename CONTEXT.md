@@ -15,7 +15,7 @@ An explicit config entry that maps a source dataset path to its destination path
 ## Send
 The operation of connecting to the Remote via SSH, performing the structured Protocol handshake, and transferring the most recent local Snapshot as an Incremental Send. A Snapshot must already exist locally; `zrb snapshot` is run first. Fails with a clear error if no local snapshots exist. Subcommand: `zrb send`.
 
-Resume Token handling is automatic: if the Remote has a pending Resume Token that matches the client's current head, it is consumed; if it refers to a different (older) snapshot, the Server aborts it before the handshake completes. If the most recent local Snapshot is already present on the Remote, Send succeeds silently with nothing to transfer.
+Resume Token handling is automatic: if the Remote has a pending Resume Token and the latest local Snapshot is not yet fully on the Remote, the token is consumed to resume the interrupted transfer. If the most recent local Snapshot is already present on the Remote, Send succeeds silently with nothing to transfer — even if a stale Resume Token also exists.
 
 Two invocation forms:
 - `zrb send` — reads the target dataset list from the config file (keys of the `datasets` map) and sends each one. All datasets are sent in parallel to all configured Remotes; per-dataset failures are logged and do not abort other datasets in flight, but the command exits non-zero if any dataset failed.
@@ -26,6 +26,10 @@ One modifier flag usable with either form:
 
 ## Snapshot (subcommand)
 Creates a zrb-prefixed Snapshot locally without transferring it to the Remote. Subcommand: `zrb snapshot`.
+
+Two invocation forms:
+- `zrb snapshot` — reads the dataset list from the config file (keys of the `datasets` map) and snapshots each one. Per-dataset failures are reported and do not abort other datasets in flight, but the command exits non-zero if any dataset failed.
+- `zrb snapshot <dataset> [<dataset>...]` — snapshots exactly the listed datasets; ignores the config's dataset list.
 
 ## Incremental Base
 The snapshot used as the base for `zfs send -i`. Must be the most recent snapshot on the Remote's target dataset — ZFS rejects any incremental stream whose base is not the destination's head. Selected by finding the most recent snapshot present on both Source and Remote (by ISO-8601 name ordering). If the Remote's most recent snapshot is absent from the Source (divergence), the Send fails with a clear error. If the Remote has no snapshots, a full send is performed instead.
@@ -65,7 +69,7 @@ The mode in which zrb runs on the Remote, invoked via SSH `ForceCommand`. Handle
 
 ## Protocol
 The structured communication between client (Source) and server (Remote) over a single SSH connection. The client speaks first:
-1. **Handshake phase** — JSON messages: client sends `ClientHello` (declaring its Client Name, target dataset, compiled version, and the name of its most recent local Snapshot); server validates the version (major and minor must match) and replies with `ServerStatus` (version accept/reject). If rejected, server closes and client surfaces the message. If accepted, the server resolves any stale Resume Token (aborting it if it refers to a different snapshot than the client's current head), then sends `ServerHello` (its most recent Snapshot on the target dataset, or absent if none, and any still-valid pending Resume Token).
+1. **Handshake phase** — JSON messages: client sends `ClientHello` (declaring its Client Name, target dataset, and compiled version); server validates the version (major and minor must match) and replies with `ServerStatus` (version accept/reject). If rejected, server closes and client surfaces the message. If accepted, the server sends `ServerHello` (its most recent Snapshot on the target dataset, or absent if none, and any pending Resume Token).
 2. **Ready phase** — JSON: client sends `ClientReady` after evaluating whether it has data to send. If `ok: false` (e.g. newest snapshot already on the Remote), the server exits cleanly without spawning `zfs receive`. If `ok: true`, the transfer phase begins.
 3. **Transfer phase** — binary stream: fixed 4 MB Chunks, each followed by a Control Frame. The client selects the Incremental Base locally (from snapshots common to both sides) and begins streaming immediately after `ClientReady`.
 4. **Status phase** — JSON: server reports success or error after the stream ends.

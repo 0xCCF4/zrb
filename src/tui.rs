@@ -117,6 +117,7 @@ pub enum SendEvent {
     RemoteCompleted { remote: String, elapsed_secs: f64, bytes: u64 },
     RemoteFailed { remote: String, error: String },
     RemoteSkipped { remote: String },
+    RemoteUpToDate { remote: String },
     AllDone,
     SummaryTick,
 }
@@ -151,6 +152,7 @@ pub enum RemoteRowState {
         error: String,
     },
     Skipped,
+    UpToDate,
 }
 
 #[derive(Debug, Clone)]
@@ -342,6 +344,11 @@ impl TuiApp {
             SendEvent::RemoteSkipped { remote } => {
                 if let Some(row) = self.remotes.iter_mut().find(|r| r.name == *remote) {
                     row.state = RemoteRowState::Skipped;
+                }
+            }
+            SendEvent::RemoteUpToDate { remote } => {
+                if let Some(row) = self.remotes.iter_mut().find(|r| r.name == *remote) {
+                    row.state = RemoteRowState::UpToDate;
                 }
             }
             SendEvent::AllDone => {
@@ -804,6 +811,10 @@ fn render_remote_row(row: &RemoteRow, name_w: usize, focused: bool) -> Line<'_> 
             name_span,
             Span::styled("  skipped", Style::default().add_modifier(Modifier::DIM)),
         ]),
+        RemoteRowState::UpToDate => Line::from(vec![
+            name_span,
+            Span::styled("  up to date", Style::default().add_modifier(Modifier::DIM)),
+        ]),
     }
 }
 
@@ -1003,6 +1014,13 @@ mod tests {
     }
 
     #[test]
+    fn remote_up_to_date_event_transitions_row_to_up_to_date() {
+        let mut app = TuiApp::for_transfer(vec!["primary".into()]);
+        app.handle_send_event(&SendEvent::RemoteUpToDate { remote: "primary".into() });
+        assert!(matches!(app.remotes[0].state, RemoteRowState::UpToDate));
+    }
+
+    #[test]
     fn s_key_skips_focused_active_row() {
         let mut app = TuiApp::for_transfer(vec!["primary".into(), "secondary".into()]);
         app.handle_send_event(&SendEvent::RemoteStarted { remote: "primary".into(), total_bytes: 100 });
@@ -1173,5 +1191,30 @@ mod tests {
         let tokens = app.cancel_map();
         app.handle_key(TuiKey::Skip);
         assert!(tokens["primary"].is_cancelled(), "single-remote Skip cancels its token");
+    }
+
+    #[test]
+    fn summary_countdown_is_ok_timeout_when_only_up_to_date() {
+        let mut app = TuiApp::for_transfer(vec!["r".into()]);
+        app.handle_send_event(&SendEvent::RemoteUpToDate { remote: "r".into() });
+        app.handle_send_event(&SendEvent::AllDone);
+        assert_eq!(app.state, TuiState::Summary);
+        assert_eq!(app.summary_countdown, SUMMARY_TIMEOUT_OK_SECS);
+    }
+
+    #[test]
+    fn summary_title_is_complete_when_all_up_to_date() {
+        let mut app = TuiApp::for_transfer(vec!["r".into()]);
+        app.handle_send_event(&SendEvent::RemoteUpToDate { remote: "r".into() });
+        app.handle_send_event(&SendEvent::AllDone);
+        assert_eq!(summary_title(&app), " Backup Complete ");
+    }
+
+    #[test]
+    fn summary_title_is_finished_when_skipped_not_up_to_date() {
+        let mut app = TuiApp::for_transfer(vec!["r".into()]);
+        app.handle_send_event(&SendEvent::RemoteSkipped { remote: "r".into() });
+        app.handle_send_event(&SendEvent::AllDone);
+        assert_eq!(summary_title(&app), " Backup Finished ");
     }
 }

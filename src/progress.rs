@@ -17,6 +17,7 @@ pub trait SendProgress: Send + Sync + 'static {
     fn remote_progress(&self, remote: &str, bytes_sent: u64);
     fn remote_completed(&self, remote: &str, bytes: u64, elapsed_secs: f64);
     fn remote_skipped(&self, remote: &str);
+    fn remote_up_to_date(&self, remote: &str);
     fn remote_failed(&self, remote: &str, error: &str);
     fn all_done(&self);
 }
@@ -59,6 +60,10 @@ impl SendProgress for ChannelProgress {
 
     fn remote_skipped(&self, remote: &str) {
         let _ = self.0.try_send(SendEvent::RemoteSkipped { remote: remote.to_owned() });
+    }
+
+    fn remote_up_to_date(&self, remote: &str) {
+        let _ = self.0.try_send(SendEvent::RemoteUpToDate { remote: remote.to_owned() });
     }
 
     fn remote_failed(&self, remote: &str, error: &str) {
@@ -245,6 +250,12 @@ impl ProgressTracker {
                 }
                 Some(format!("{remote}: skipped"))
             }
+            SendEvent::RemoteUpToDate { remote } => {
+                if let Some(entry) = self.remotes.get_mut(remote) {
+                    entry.state = RemoteEntryState::Terminal;
+                }
+                Some(format!("{remote}: up to date"))
+            }
             SendEvent::AllDone => {
                 self.done = true;
                 None
@@ -322,7 +333,7 @@ pub async fn run_plain(mut rx: Receiver<SendEvent>) -> anyhow::Result<()> {
 pub async fn run_inline(mut rx: Receiver<SendEvent>, remote_names: Vec<String>) -> anyhow::Result<()> {
     let mp = MultiProgress::new();
     let style = ProgressStyle::with_template(
-        "{prefix:.bold}  [{bar:16}] {pos:>3}%  {msg}",
+        "{prefix:.bold}  [{bar:16}] {percent:>3}%  {msg}",
     )
     .unwrap_or_else(|_| ProgressStyle::default_bar())
     .progress_chars("\u{2588}\u{2591}\u{2591}");
@@ -378,6 +389,11 @@ pub async fn run_inline(mut rx: Receiver<SendEvent>, remote_names: Vec<String>) 
             SendEvent::RemoteSkipped { remote } => {
                 if let Some(pb) = bars.get(remote) {
                     pb.finish_with_message("skipped");
+                }
+            }
+            SendEvent::RemoteUpToDate { remote } => {
+                if let Some(pb) = bars.get(remote) {
+                    pb.finish_with_message("up to date");
                 }
             }
             SendEvent::AllDone => {
@@ -531,6 +547,19 @@ mod tests {
         });
         assert!(line.is_some());
         assert!(line.unwrap().contains("skipped"));
+        assert!(tracker.tick_lines().is_empty());
+    }
+
+    // Cycle 10 — RemoteUpToDate returns immediate "up to date" line and removes from ticks
+    #[test]
+    fn up_to_date_returns_immediate_line_and_leaves_tick() {
+        let names = vec!["tank/home → primary".to_owned()];
+        let mut tracker = ProgressTracker::new(&names);
+        let line = tracker.handle_event(&SendEvent::RemoteUpToDate {
+            remote: "tank/home → primary".to_owned(),
+        });
+        assert!(line.is_some());
+        assert!(line.unwrap().contains("up to date"));
         assert!(tracker.tick_lines().is_empty());
     }
 

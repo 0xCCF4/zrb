@@ -42,10 +42,6 @@ pub(crate) fn decide_transfer(
     local_snaps: &[String],
     latest: &str,
 ) -> anyhow::Result<TransferDecision> {
-    if let Some(token) = hello.resume_token.clone() {
-        return Ok(TransferDecision::ResumeSend { token });
-    }
-
     let latest_suffix = latest.split_once('@').map_or(latest, |(_, n)| n);
     let already_on_server = hello
         .head
@@ -55,6 +51,10 @@ pub(crate) fn decide_transfer(
 
     if already_on_server {
         return Ok(TransferDecision::AlreadyUpToDate);
+    }
+
+    if let Some(token) = hello.resume_token.clone() {
+        return Ok(TransferDecision::ResumeSend { token });
     }
 
     let Some(remote_head) = hello.head.as_deref() else {
@@ -316,7 +316,7 @@ async fn send_to_remote(ctx: SendContext) -> anyhow::Result<()> {
     match result {
         Ok(0) => {
             if let Some(ref p) = ctx.progress {
-                p.remote_skipped(&row_key);
+                p.remote_up_to_date(&row_key);
             }
             Ok(())
         }
@@ -625,6 +625,9 @@ mod tests {
         fn remote_skipped(&self, remote: &str) {
             self.0.lock().unwrap().push(format!("skipped:{remote}"));
         }
+        fn remote_up_to_date(&self, remote: &str) {
+            self.0.lock().unwrap().push(format!("up_to_date:{remote}"));
+        }
         fn remote_failed(&self, remote: &str, error: &str) {
             self.0.lock().unwrap().push(format!("failed:{remote}:{error}"));
         }
@@ -644,9 +647,23 @@ mod tests {
     }
 
     #[test]
-    fn decide_transfer_resume_token_takes_priority_over_head() {
+    fn decide_transfer_already_up_to_date_wins_over_resume_token() {
+        // Stale resume token must not cause a re-transfer when the latest snapshot
+        // is already on the remote — AlreadyUpToDate takes priority.
         let h = hello(Some("backup/data@zrb-2026-01-10T00:00:00Z"), Some("tok"));
         let local = vec!["tank/data@zrb-2026-01-10T00:00:00Z".to_owned()];
+        let result = decide_transfer(&h, &local, "tank/data@zrb-2026-01-10T00:00:00Z").unwrap();
+        assert_eq!(result, TransferDecision::AlreadyUpToDate);
+    }
+
+    #[test]
+    fn decide_transfer_resume_token_used_when_latest_not_yet_on_remote() {
+        // Resume token is honoured when the latest snapshot is not yet fully received.
+        let h = hello(Some("backup/data@zrb-2026-01-01T00:00:00Z"), Some("tok"));
+        let local = vec![
+            "tank/data@zrb-2026-01-01T00:00:00Z".to_owned(),
+            "tank/data@zrb-2026-01-10T00:00:00Z".to_owned(),
+        ];
         let result = decide_transfer(&h, &local, "tank/data@zrb-2026-01-10T00:00:00Z").unwrap();
         assert_eq!(result, TransferDecision::ResumeSend { token: "tok".to_owned() });
     }
