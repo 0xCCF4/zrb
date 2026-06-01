@@ -15,7 +15,7 @@
         packages.default = pkgs.callPackage ./nix/packages/zrb.nix { };
 
         devShells.default = pkgs.mkShell {
-          packages = [ pkgs.rustc pkgs.cargo pkgs.clippy ];
+          packages = [ pkgs.rustc pkgs.cargo pkgs.clippy pkgs.zfs ];
         };
 
         checks = {
