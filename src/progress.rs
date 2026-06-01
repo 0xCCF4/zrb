@@ -2,9 +2,76 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::tui::SendEvent;
+
+// ── SendProgress trait ────────────────────────────────────────────────────────
+
+/// Observer for per-remote transfer lifecycle events.
+///
+/// Implementors receive calls at each stage of a Send operation.
+/// All methods take `&self` and are synchronous — implementors must not block.
+pub trait SendProgress: Send + Sync + 'static {
+    fn remote_started(&self, remote: &str, total_bytes: u64);
+    fn remote_progress(&self, remote: &str, bytes_sent: u64);
+    fn remote_completed(&self, remote: &str, bytes: u64, elapsed_secs: f64);
+    fn remote_skipped(&self, remote: &str);
+    fn remote_failed(&self, remote: &str, error: &str);
+    fn all_done(&self);
+}
+
+/// Adapter: implements [`SendProgress`] by forwarding events as [`SendEvent`] messages.
+///
+/// Used to connect the `ops::send` progress interface to the existing channel-based
+/// TUI and progress runners (`run_tui`, `run_inline`, `run_plain`).
+pub struct ChannelProgress(Sender<SendEvent>);
+
+impl ChannelProgress {
+    #[must_use]
+    pub fn new(tx: Sender<SendEvent>) -> Self {
+        Self(tx)
+    }
+}
+
+impl SendProgress for ChannelProgress {
+    fn remote_started(&self, remote: &str, total_bytes: u64) {
+        let _ = self.0.try_send(SendEvent::RemoteStarted {
+            remote: remote.to_owned(),
+            total_bytes,
+        });
+    }
+
+    fn remote_progress(&self, remote: &str, bytes_sent: u64) {
+        let _ = self.0.try_send(SendEvent::RemoteProgress {
+            remote: remote.to_owned(),
+            bytes_sent,
+        });
+    }
+
+    fn remote_completed(&self, remote: &str, bytes: u64, elapsed_secs: f64) {
+        let _ = self.0.try_send(SendEvent::RemoteCompleted {
+            remote: remote.to_owned(),
+            bytes,
+            elapsed_secs,
+        });
+    }
+
+    fn remote_skipped(&self, remote: &str) {
+        let _ = self.0.try_send(SendEvent::RemoteSkipped { remote: remote.to_owned() });
+    }
+
+    fn remote_failed(&self, remote: &str, error: &str) {
+        let _ = self.0.try_send(SendEvent::RemoteFailed {
+            remote: remote.to_owned(),
+            error: error.to_owned(),
+        });
+    }
+
+    fn all_done(&self) {
+        let _ = self.0.try_send(SendEvent::AllDone);
+    }
+}
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 

@@ -19,6 +19,7 @@ use zrb::ops::list as ops_list;
 use zrb::ops::prune as ops_prune;
 use zrb::ops::send::send_on;
 use zrb::ops::server::run_server_on;
+use zrb::progress::ChannelProgress;
 use zrb::protocol::codec::{self, ClientHello, ClientReady, ServerHello, ServerStatus};
 use zrb::retention::policy::RetentionConfig;
 use zrb::tui::SendEvent;
@@ -213,6 +214,7 @@ fn run_send_collecting_events(
     let (client_half, server_half) = tokio::io::duplex(8 * 1024 * 1024);
     let server = spawn_server(srv_cfg, vec![client_name.to_owned()], server_half);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<SendEvent>(256);
+    let progress = std::sync::Arc::new(ChannelProgress::new(tx));
 
     let rt = tokio::runtime::Runtime::new().expect("tokio rt");
     let bytes = rt
@@ -228,7 +230,7 @@ fn run_send_collecting_events(
                 &mut stc_buf,
                 &mut client_write,
                 "test-remote",
-                Some(tx),
+                Some(progress),
                 None,
             )
             .await

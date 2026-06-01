@@ -12,6 +12,8 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error("cannot parse config: {0}")]
     Toml(#[from] toml::de::Error),
+    #[error("dataset '{dataset}' references unknown remote '{remote}'")]
+    UnknownRemote { dataset: String, remote: String },
 }
 
 /// Parse a human-readable bandwidth string into bytes/sec.
@@ -124,6 +126,28 @@ impl SourceConfig {
         let mut keys: Vec<String> = self.datasets.keys().cloned().collect();
         keys.sort();
         keys
+    }
+
+    /// Validate cross-field constraints.
+    ///
+    /// Checks that every remote name referenced in a Dataset Mapping exists in
+    /// the `[remotes]` table. Returns `self` unchanged on success.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::UnknownRemote`] for the first dataset entry that
+    /// references a remote not present in `[remotes]`.
+    pub fn validate(self) -> Result<Self, ConfigError> {
+        for (dataset, remote_targets) in &self.datasets {
+            for remote_name in remote_targets.keys() {
+                if !self.remotes.contains_key(remote_name) {
+                    return Err(ConfigError::UnknownRemote {
+                        dataset: dataset.clone(),
+                        remote: remote_name.clone(),
+                    });
+                }
+            }
+        }
+        Ok(self)
     }
 }
 
@@ -430,5 +454,51 @@ monthly_for_days = 365
         std::fs::write(&path, SOURCE_TOML).unwrap();
         let cfg = load_source(&path).expect("should parse");
         assert_eq!(cfg.name(), "my-laptop");
+    }
+
+    // ── SourceConfig::validate ────────────────────────────────────────────
+
+    #[test]
+    fn validate_returns_ok_when_all_dataset_remotes_exist() {
+        let cfg: SourceConfig = toml::from_str(SOURCE_TOML).expect("should parse");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_errors_when_dataset_references_unknown_remote() {
+        let bad = SOURCE_TOML.replace(
+            "[datasets.\"tank/home\"]\nprimary = \"backup/laptop/home\"",
+            "[datasets.\"tank/home\"]\nghost = \"backup/laptop/home\"",
+        );
+        let cfg: SourceConfig = toml::from_str(&bad).expect("should parse");
+        let err = cfg.validate().expect_err("should fail");
+        assert!(matches!(err, ConfigError::UnknownRemote { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("ghost"), "error should name the unknown remote: {msg}");
+        assert!(msg.contains("tank/home"), "error should name the dataset: {msg}");
+    }
+
+    #[test]
+    fn validate_error_message_contains_both_dataset_and_remote_name() {
+        const TOML: &str = r#"
+[source]
+name = "test"
+
+[remotes.primary]
+host = "backup.example.com"
+
+[datasets."tank/data"]
+nonexistent = "backup/data"
+
+[retention]
+recent = 7
+weekly_for_days = 30
+monthly_for_days = 365
+"#;
+        let cfg: SourceConfig = toml::from_str(TOML).expect("should parse");
+        let err = cfg.validate().expect_err("should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("nonexistent"), "remote name in error: {msg}");
+        assert!(msg.contains("tank/data"), "dataset name in error: {msg}");
     }
 }

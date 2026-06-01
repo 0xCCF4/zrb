@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 use std::process;
 
+use std::sync::Arc;
+
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use sd_notify::NotifyState;
 
-use zrb::{config, ops};
+use zrb::{config, ops, progress::ChannelProgress};
 
 #[derive(ValueEnum, Clone)]
 enum ShellChoice {
@@ -57,11 +59,6 @@ enum Commands {
         /// Restrict send to a named Remote (repeatable).
         #[arg(long = "remote")]
         remotes: Vec<String>,
-
-        /// Resume an interrupted transfer without creating a new snapshot.
-        /// Errors if the newest local snapshot is already present on the Remote.
-        #[arg(long)]
-        resume: bool,
 
         /// Send to each Remote one at a time instead of in parallel.
         #[arg(long)]
@@ -199,7 +196,7 @@ async fn run() -> anyhow::Result<()> {
                 validate_dataset(ds)?;
             }
             let cfg_path = cli.config.unwrap_or_else(default_source_config);
-            let cfg = config::load_source(&cfg_path)?;
+            let cfg = config::load_source(&cfg_path)?.validate()?;
             for ds in &datasets {
                 let name = ops::snapshot::snapshot(ds, &cfg)?;
                 log::info!("created {name}");
@@ -221,7 +218,6 @@ async fn run() -> anyhow::Result<()> {
         Commands::Send {
             datasets,
             remotes,
-            resume,
             sequential,
             tui,
         } => {
@@ -229,7 +225,7 @@ async fn run() -> anyhow::Result<()> {
                 validate_dataset(ds)?;
             }
             let cfg_path = cli.config.unwrap_or_else(default_source_config);
-            let cfg = config::load_source(&cfg_path)?;
+            let cfg = config::load_source(&cfg_path)?.validate()?;
             let _ = sd_notify::notify(&[NotifyState::Ready]);
             let datasets = resolve_datasets(datasets, &cfg);
             let ds_refs: Vec<&str> = datasets.iter().map(String::as_str).collect();
@@ -262,7 +258,7 @@ async fn run() -> anyhow::Result<()> {
             // Safety: `isatty` is always safe to call with a valid fd.
             let is_tty = unsafe { libc::isatty(libc::STDOUT_FILENO) } != 0;
 
-            let (event_tx, progress_task, cancel_map) = if tui {
+            let (progress, progress_task, cancel_map) = if tui {
                 if !is_tty {
                     anyhow::bail!(
                         "--tui requires a controlling TTY; \
@@ -270,7 +266,6 @@ async fn run() -> anyhow::Result<()> {
                     );
                 }
 
-                // Build the dataset → remote-name display list for the countdown screen.
                 let display_info: Vec<(String, Vec<String>)> = ds_refs
                     .iter()
                     .map(|&ds| {
@@ -303,29 +298,25 @@ async fn run() -> anyhow::Result<()> {
 
                 let (tx, rx) = tokio::sync::mpsc::channel(256);
                 let task = tokio::spawn(zrb::tui::run_transfer(rx, row_keys, cancel_tokens));
+                let p: Arc<dyn zrb::progress::SendProgress> = Arc::new(ChannelProgress::new(tx));
 
-                (Some(tx), Some(task), Some(cancel_for_send))
+                (Some(p), Some(task), Some(cancel_for_send))
             } else if is_tty {
                 let (tx, rx) = tokio::sync::mpsc::channel(256);
                 let task = tokio::spawn(zrb::progress::run_inline(rx, row_keys));
-                (Some(tx), Some(task), None)
+                let p: Arc<dyn zrb::progress::SendProgress> = Arc::new(ChannelProgress::new(tx));
+                (Some(p), Some(task), None)
             } else {
                 let (tx, rx) = tokio::sync::mpsc::channel(256);
                 let task = tokio::spawn(zrb::progress::run_plain(rx));
-                (Some(tx), Some(task), None)
+                let p: Arc<dyn zrb::progress::SendProgress> = Arc::new(ChannelProgress::new(tx));
+                (Some(p), Some(task), None)
             };
 
-            if resume {
-                ops::send::send_resume(
-                    &ds_refs, filter.as_deref(), &cfg, sequential, event_tx, cancel_map,
-                )
-                .await?;
-            } else {
-                ops::send::send(
-                    &ds_refs, filter.as_deref(), &cfg, sequential, event_tx, cancel_map,
-                )
-                .await?;
-            }
+            ops::send::send(
+                &ds_refs, filter.as_deref(), &cfg, sequential, progress, cancel_map,
+            )
+            .await?;
 
             if let Some(task) = progress_task {
                 task.await??;
@@ -593,24 +584,9 @@ mod tests {
     }
 
     #[test]
-    fn send_resume_flag_parses() {
+    fn send_resume_flag_is_rejected() {
         let cli = Cli::try_parse_from(["zrb", "send", "--resume", "tank/home"]);
-        assert!(cli.is_ok(), "zrb send --resume <dataset> should parse");
-        if let Ok(Cli {
-            command: Commands::Send { resume, .. },
-            ..
-        }) = cli
-        {
-            assert!(resume, "--resume should be true");
-        }
-    }
-
-    #[test]
-    fn send_resume_flag_absent_defaults_false() {
-        let cli = Cli::try_parse_from(["zrb", "send", "tank/home"]).unwrap();
-        if let Commands::Send { resume, .. } = cli.command {
-            assert!(!resume, "--resume should default to false");
-        }
+        assert!(cli.is_err(), "--resume must not exist on the send subcommand");
     }
 
     #[test]

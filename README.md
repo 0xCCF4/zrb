@@ -3,14 +3,13 @@
 `zrb` automates what raw `zfs send` leaves to you: incremental base selection, interrupted-transfer resumption,
 snapshot management, and multi-remote delivery. NixOS modules for both server and client included — drop in and go.
 
-One command does the work:
+Two commands do the work:
 
 ```sh
-zrb send tank/home  # sends to all configured remotes
-# - creates a new snapshot
-# - queries each remote for its existing snapshots
-# - selects the base that minimizes transferred data
-# - resumes any interrupted transfer, then streams the delta
+zrb snapshot tank/home  # create a point-in-time snapshot
+zrb send tank/home      # transfer to all configured remotes
+# - queries each remote for its latest stored snapshot
+# - resumes/starts snapshot transfer
 ```
 
 Pruning runs independently on each host according to its own retention policy.
@@ -19,17 +18,18 @@ Pruning runs independently on each host according to its own retention policy.
 
 ```
 Source (laptop)  ──SSH──►  Remote (backup server)
-  zrb send                    zrb server (ForceCommand)
+  zrb send                    zrb server
 ```
 
 `zrb send` works in two phases over a single SSH connection:
 
-1. **Handshake** — the server reports its most recent snapshot; the client uses it as the
-   incremental base (or falls back to a full send if the server has no snapshots). If the
-   server's head is absent from the local history, the send fails with a clear error.
-2. **Transfer** — the client runs `zfs send` and pipes the stream to `zfs receive` on the
-   server. If a previous transfer was interrupted, the client resumes it via ZFS native
-   resume tokens before starting the next send.
+1. **Handshake** — the server reports its most recent snapshot and any aborted transactions.
+   The client uses the server's head as the incremental base (or falls back to a full send if
+   the server has no snapshots). If a resume token is present for the same snapshot the client
+   is about to send, `zfs send -t <token>` is used to pick up mid-stream. If the server's head
+   is absent from the local history, the send fails with an error.
+2. **Transfer** — the client streams the delta to `zfs receive` on the server. If the latest
+   local snapshot is already on the server, to send is a no-op.
 
 All connections are push from the client — the server runs only as an SSH `ForceCommand`.
 
@@ -180,29 +180,28 @@ monthly_for_days = 365
 
 All subcommands accept `--verbose` for debug logging and `--config <path>` to override the default config location.
 
-### `zrb send <dataset>...`
-
-Creates a snapshot, connects to all configured Remotes, and transfers incrementally.
-
-```sh
-# Send two datasets to all remotes
-zrb send tank/home tank/documents
-
-# Restrict to a single named remote
-zrb send tank/home --remote primary
-```
-
-If the previous transfer was interrupted, `zrb send --resume` resumes it automatically.
-
 ### `zrb snapshot <dataset>...`
 
-Creates a `zrb-`-prefixed snapshot locally without transferring it.
+Creates a `zrb-`-prefixed snapshot locally without transferring it. Run this before `zrb send`.
 
 ```sh
 zrb snapshot tank/home tank/documents
 ```
 
-Useful for taking a local checkpoint before a risky operation.
+### `zrb send <dataset>...`
+
+Connects to all configured Remotes and transfers the most recent local snapshot incrementally.
+If the remote already has the latest snapshot, the command succeeds silently with nothing to transfer.
+Resume tokens from interrupted transfers are detected and consumed automatically.
+
+```sh
+# Snapshot then send two datasets to all remotes
+zrb snapshot tank/home tank/documents
+zrb send tank/home tank/documents
+
+# Restrict to a single named remote
+zrb send tank/home --remote primary
+```
 
 ### `zrb list <dataset>`
 
@@ -256,6 +255,8 @@ Wants=network-online.target
 [Service]
 Type=notify
 User=<user>
+# Create the snapshot first; if this fails the send is skipped.
+ExecStartPre=/usr/local/bin/zrb snapshot tank/home tank/documents
 ExecStart=/usr/local/bin/zrb send tank/home tank/documents
 # Kill and restart if a single 4 MiB chunk takes longer than this to transfer.
 WatchdogSec=1m
@@ -387,8 +388,9 @@ zfs allow -u zrb-prune destroy,mount backup/laptop
 ```
 
 The module creates the `zrb` system user, writes `/etc/zrb/client.toml`, and registers a `zrb-send-<name>` systemd
-service+timer and a `zrb-prune` service+timer. The SSH key at `sshKey` must be provisioned separately (e.g. via
-`sops-nix` or `agenix`).
+service+timer and a `zrb-prune` service+timer. Each send service runs `zrb snapshot` as `ExecStartPre` and
+`zrb send` as `ExecStart` — if snapshot creation fails the send is skipped for that run.
+The SSH key at `sshKey` must be provisioned separately (e.g. via `sops-nix` or `agenix`).
 
 ### noxa SSH integration
 

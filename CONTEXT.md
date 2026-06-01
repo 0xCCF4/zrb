@@ -13,7 +13,9 @@ A ZFS point-in-time snapshot created and managed by zrb. Always named with the p
 An explicit config entry that maps a source dataset path to its destination path on the Remote. There is no auto-derivation — every backed-up dataset has its own mapping entry.
 
 ## Send
-The compound operation of: creating a Snapshot on the Source, connecting to the Remote via SSH, performing the structured Protocol handshake, and transferring the snapshot as an Incremental Send. Subcommand: `zrb send`.
+The operation of connecting to the Remote via SSH, performing the structured Protocol handshake, and transferring the most recent local Snapshot as an Incremental Send. A Snapshot must already exist locally; `zrb snapshot` is run first. Fails with a clear error if no local snapshots exist. Subcommand: `zrb send`.
+
+Resume Token handling is automatic: if the Remote has a pending Resume Token that matches the client's current head, it is consumed; if it refers to a different (older) snapshot, the Server aborts it before the handshake completes. If the most recent local Snapshot is already present on the Remote, Send succeeds silently with nothing to transfer.
 
 Two invocation forms:
 - `zrb send` — reads the target dataset list from the config file (keys of the `datasets` map) and sends each one. All datasets are sent in parallel to all configured Remotes; per-dataset failures are logged and do not abort other datasets in flight, but the command exits non-zero if any dataset failed.
@@ -63,13 +65,15 @@ The mode in which zrb runs on the Remote, invoked via SSH `ForceCommand`. Handle
 
 ## Protocol
 The structured communication between client (Source) and server (Remote) over a single SSH connection. The client speaks first:
-1. **Handshake phase** — JSON messages: client sends `ClientHello` (declaring its Client Name, target dataset, and compiled version); server validates the version (major and minor must match) and replies with `ServerStatus` (version accept/reject). If rejected, server closes and client surfaces the message. If accepted, server then sends `ServerHello` (its most recent Snapshot on the target dataset, or absent if none, and any pending Resume Token).
+1. **Handshake phase** — JSON messages: client sends `ClientHello` (declaring its Client Name, target dataset, compiled version, and the name of its most recent local Snapshot); server validates the version (major and minor must match) and replies with `ServerStatus` (version accept/reject). If rejected, server closes and client surfaces the message. If accepted, the server resolves any stale Resume Token (aborting it if it refers to a different snapshot than the client's current head), then sends `ServerHello` (its most recent Snapshot on the target dataset, or absent if none, and any still-valid pending Resume Token).
 2. **Ready phase** — JSON: client sends `ClientReady` after evaluating whether it has data to send. If `ok: false` (e.g. newest snapshot already on the Remote), the server exits cleanly without spawning `zfs receive`. If `ok: true`, the transfer phase begins.
 3. **Transfer phase** — binary stream: fixed 4 MB Chunks, each followed by a Control Frame. The client selects the Incremental Base locally (from snapshots common to both sides) and begins streaming immediately after `ClientReady`.
 4. **Status phase** — JSON: server reports success or error after the stream ends.
 
 ## Resume Token
-A ZFS-native opaque string saved by `zfs receive -s` when a transfer is interrupted mid-stream. Retrieved via `zfs get receive_resume_token <dataset>`. When present, the client issues `zfs send -t <token>` instead of a normal Incremental Send. The Remote discards the token (via `zfs receive -A`) when Prune runs on the target dataset, after which the next Send retries from scratch.
+A ZFS-native opaque string saved by `zfs receive -s` when a transfer is interrupted mid-stream. Retrieved via `zfs get receive_resume_token <dataset>`. The Server stores the name of the Snapshot that was being sent when the token was created (as the `zrb:resume-snapshot` ZFS user property).
+
+On the next Send, the Server compares the stored snapshot name against the client's current head (carried in `ClientHello`). If they match, the client issues `zfs send -t <token>` to resume. If they differ, the Server aborts the stale token via `zfs receive -A` before completing the handshake, and the client proceeds with a normal Incremental Send of its current head. The Remote also discards the token when Prune runs on the target dataset.
 
 ## Client Name
 A user-chosen human-readable identifier for a Source host, set once in the Source's config file. Included in handshake JSON. On the Remote, each SSH authorized key entry binds a key to a set of permitted Client Names via one or more `ForceCommand --client <name>` arguments. The client self-declares its name; the server rejects any handshake where the declared name is not in the permitted set for the connecting key. Multiple clients may share one SSH key if they are all listed in that key's `--client` set.
