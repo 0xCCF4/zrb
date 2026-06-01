@@ -21,7 +21,7 @@ jobs:
 
   integration:
     name: Integration (ZFS)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-25.04
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
