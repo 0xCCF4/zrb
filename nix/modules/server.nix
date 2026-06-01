@@ -34,8 +34,9 @@ let
         type = package;
         default = pkgs.callPackage ../packages/zrb-wrapped.nix {
           zfs = nixosConfig.boot.zfs.package;
+          ssh = nixosConfig.programs.ssh.package;
         };
-        defaultText = literalExpression "pkgs.callPackage ../packages/zrb-wrapped.nix { zfs = config.boot.zfs.package; }";
+        defaultText = literalExpression "pkgs.callPackage ../packages/zrb-wrapped.nix { zfs = config.boot.zfs.package; ssh = config.programs.ssh.package; }";
         description = "The zrb package to use.";
       };
       createUser = mkOption {
