@@ -31,6 +31,7 @@
       };
 
       flake = {
+        nixosModules.overlay = import ./nix/modules/overlay.nix;
         nixosModules.server = import ./nix/modules/server.nix;
         nixosModules.client = import ./nix/modules/client.nix;
         nixosModules.noxa = import ./nix/modules/noxa.nix;

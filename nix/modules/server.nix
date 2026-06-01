@@ -1,6 +1,7 @@
 { config, lib, pkgs, ... }:
 with lib;
 let
+  nixosConfig = config;
   cfg = config.services.zrb.server;
   toml = pkgs.formats.toml { };
 
@@ -31,8 +32,10 @@ let
       enable = mkEnableOption "zrb server instance '${name}'";
       package = mkOption {
         type = package;
-        default = pkgs.callPackage ../packages/zrb.nix { };
-        defaultText = literalExpression "pkgs.callPackage ../packages/zrb.nix {}";
+        default = pkgs.callPackage ../packages/zrb-wrapped.nix {
+          zfs = nixosConfig.boot.zfs.package;
+        };
+        defaultText = literalExpression "pkgs.callPackage ../packages/zrb-wrapped.nix { zfs = config.boot.zfs.package; }";
         description = "The zrb package to use.";
       };
       createUser = mkOption {
@@ -151,6 +154,8 @@ in
       }
     '';
   };
+
+  imports = [ ./overlay.nix ];
 
   config = {
     systemd.services = mkMerge (
