@@ -36,8 +36,7 @@ struct Cli {
 enum Commands {
     /// Create a zrb-managed snapshot of one or more datasets.
     Snapshot {
-        /// Datasets to snapshot (e.g. tank/home).
-        #[arg(required = true)]
+        /// Datasets to snapshot (e.g. tank/home). Omit to snapshot all datasets from config.
         datasets: Vec<String>,
     },
 
@@ -197,9 +196,19 @@ async fn run() -> anyhow::Result<()> {
             }
             let cfg_path = cli.config.unwrap_or_else(default_source_config);
             let cfg = config::load_source(&cfg_path)?.validate()?;
+            let datasets = resolve_datasets(datasets, &cfg);
+            let mut any_failed = false;
             for ds in &datasets {
-                let name = ops::snapshot::snapshot(ds, &cfg)?;
-                log::info!("created {name}");
+                match ops::snapshot::snapshot(ds, &cfg) {
+                    Ok(name) => log::info!("created {name}"),
+                    Err(e) => {
+                        eprintln!("error: snapshot {ds}: {e}");
+                        any_failed = true;
+                    }
+                }
+            }
+            if any_failed {
+                std::process::exit(1);
             }
         }
 

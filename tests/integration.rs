@@ -1101,6 +1101,63 @@ fn send_on_emits_started_progress_completed_in_order() {
 
 #[test]
 #[ignore = "requires ZFS and root privileges"]
+fn send_on_returns_ok_zero_and_no_events_when_server_already_has_snapshot() {
+    if !zfs_available() {
+        eprintln!("SKIP: /dev/zfs not present — ZFS kernel module unavailable");
+        return;
+    }
+    let src = ZfsTestPool::create("zrb-uptodate-src");
+    let dst = ZfsTestPool::create("zrb-uptodate-dst");
+    let src_ds = src.dataset("data");
+    let dst_ds = dst.dataset("data");
+
+    Command::new("zfs")
+        .args(["create", "-o", "compression=off", &src_ds])
+        .status()
+        .expect("zfs create src");
+    std::fs::write(format!("/{src_ds}/file.bin"), vec![0u8; 64 * 1024]).expect("write");
+    zfs_client::create_snapshot(&src_ds, "zrb-2026-01-01T00:00:00Z").expect("snapshot");
+    let latest = format!("{src_ds}@zrb-2026-01-01T00:00:00Z");
+    let local_snaps = ops_list::list(&src_ds).expect("list snaps");
+
+    // First send — server receives the snapshot.
+    run_send(&latest, &local_snaps, &dst_ds, "test-client", server_config_for("test-client", &dst_ds));
+
+    // Second send with the same snapshot — server is already up to date.
+    let remote = dummy_remote();
+    let (client_half, server_half) = tokio::io::duplex(8 * 1024 * 1024);
+    let server = spawn_server(
+        server_config_for("test-client", &dst_ds),
+        vec!["test-client".to_owned()],
+        server_half,
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<SendEvent>(256);
+    let progress = std::sync::Arc::new(ChannelProgress::new(tx));
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+    let bytes = rt.block_on(async {
+        let (client_read, mut client_write) = tokio::io::split(client_half);
+        let mut buf = tokio::io::BufReader::new(client_read);
+        send_on(
+            &latest, &local_snaps, &remote, &dst_ds, "test-client",
+            &mut buf, &mut client_write, "test-remote", Some(progress), None,
+        )
+        .await
+    }).expect("send_on");
+
+    server.join().expect("server thread").expect("server error");
+
+    assert_eq!(bytes, 0, "send_on should return 0 when server is already up to date");
+
+    let events: Vec<SendEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        events.is_empty(),
+        "send_on should emit no progress events when already up to date; got: {events:?}",
+    );
+}
+
+#[test]
+#[ignore = "requires ZFS and root privileges"]
 fn json_zfs_calls_round_trip_against_real_pool() {
     if !zfs_available() {
         eprintln!("SKIP: /dev/zfs not present — ZFS kernel module unavailable");

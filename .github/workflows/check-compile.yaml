@@ -43,7 +43,6 @@ jobs:
     strategy:
       matrix:
         nixpkgs:
-          - release-25.05
           - release-25.11
           - nixos-unstable
     steps:

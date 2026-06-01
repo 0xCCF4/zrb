@@ -26,8 +26,14 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install ZFS userland tools
-        run: sudo apt-get update -y && sudo apt-get install -y zfsutils-linux
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Install ZFS 2.3+ from flake devShell
+        run: |
+          nix develop --command bash -c 'echo "$(dirname "$(which zfs)")" >> "$GITHUB_PATH"'
+          sudo modprobe zfs 2>/dev/null || true
       - name: All tests (including ZFS integration)
         run: sudo env "PATH=$PATH" "RUSTUP_HOME=$RUSTUP_HOME" "CARGO_HOME=$CARGO_HOME" cargo test -- --include-ignored
 
@@ -40,16 +46,5 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      - name: Ensure git HEAD exists
-        run: |
-          git config --global --add safe.directory '*'
-          if ! git rev-parse HEAD > /dev/null 2>&1; then
-            rm -rf .git
-            git init
-            git config user.email ci@localhost
-            git config user.name CI
-            git add -A
-            git commit -m init
-          fi
       - name: Eval tests
         run: nix build .#checks.x86_64-linux.module-eval-tests
