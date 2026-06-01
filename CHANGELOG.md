@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/0xCCF4/zrb/compare/v0.2.0...v0.3.0) - 2026-06-01
+
+### Fixed
+
+- ci tests
+- revisited snapshot command and fixed tui formatting bugs
+- split send and snapshot into two different commands
+
+### Other
+
+- *(deps)* bump log from 0.4.29 to 0.4.30
+- progress bars
+- use zfs json output instead of human readable cli out
+
 ## [0.2.0](https://github.com/0xCCF4/zrb/compare/v0.1.1...v0.2.0) - 2026-05-30
 
 ### Fixed
